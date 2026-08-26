@@ -3,12 +3,13 @@ import pandas as pd
 import json
 import os
 import io
+import re
 from datetime import datetime
 import google.generativeai as genai
 from PIL import Image
 
 # --------------------------------------------------
-# 初期設定
+# 初期設定 & API設定
 # --------------------------------------------------
 st.set_page_config(page_title="受発注DXタブレットアプリ", layout="wide")
 
@@ -21,21 +22,22 @@ COLUMNS = [
     "住所", "電話番号", "品番", "品名", "数量", "単価", "小計", "希望納期", "備考"
 ]
 
-# APIキー設定とモデル初期化（安全なフォールバック対応）
-GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
+# ご指定のAPIキーを設定
+GEMINI_API_KEY = "AIzaSyBkraxElwA3Fnx5muYa9X_vwaqMA-97uks"
+
 model = None
-if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GEMINI_API_KEY":
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-1.5-flash")
-    except Exception as e:
-        st.error(f"Gemini初期化エラー: {e}")
+try:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-1.5-flash")
+except Exception as e:
+    st.error(f"Gemini初期化エラー: {e}")
 
 # --------------------------------------------------
-# マスタデータの読み込み
+# マスタデータの読み込み（自動初期化・ゆらぎ吸収）
 # --------------------------------------------------
 @st.cache_data(ttl=60)
 def load_customer_master():
+    """顧客マスタCSVの読み込み"""
     if not os.path.exists(CUSTOMERS_CSV):
         return pd.DataFrame([
             {"顧客コード": "1", "顧客名": "株式会社サンプル商事 本社", "郵便番号": "100-0005", "住所": "東京都千代田区丸の内1-1-1", "電話番号": "03-1234-5678"},
@@ -78,11 +80,15 @@ def load_customer_master():
 
 @st.cache_data(ttl=60)
 def load_item_master():
+    """商品マスタCSVの読み込み"""
     if not os.path.exists(ITEMS_CSV):
         return pd.DataFrame([
             {"品番": "A-101", "品名": "超音波ノズル先端部品", "標準単価": 12000},
             {"品番": "A-102", "品名": "高圧ホース 3m", "標準単価": 8500},
             {"品番": "AK-35", "品名": "専用洗浄液 AK-35", "標準単価": 5500},
+            {"品番": "B-201", "品名": "専用洗浄溶剤 5L", "標準単価": 4500},
+            {"品番": "B-202", "品名": "皮革用リカラー染料（ブラック）", "標準単価": 3200},
+            {"品番": "C-301", "品名": "交換用パッキンセット", "標準単価": 1500},
         ])
     try:
         return pd.read_csv(ITEMS_CSV, encoding="utf-8-sig", dtype={"品番": str})
@@ -90,6 +96,7 @@ def load_item_master():
         return pd.DataFrame(columns=["品番", "品名", "標準単価"])
 
 def load_orders_safe():
+    """注文履歴の安全読み込み"""
     if not os.path.exists(ORDERS_CSV):
         return pd.DataFrame(columns=COLUMNS)
     try:
@@ -104,17 +111,25 @@ def load_orders_safe():
         return df
 
 def to_excel_bytes(df):
+    """Excel形式（.xlsx）のバイナリ生成"""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='受注データ一覧')
     return output.getvalue()
 
 def save_order_items(channel, code, customer, zip_code, tel, address, delivery_date, items, notes):
+    """注文保存処理"""
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     new_rows = []
     for itm in items:
-        qty = int(itm.get("qty", itm.get("quantity", 1)))
-        price = int(itm.get("price", 0))
+        try:
+            qty = int(itm.get("qty", itm.get("quantity", 1)))
+        except Exception:
+            qty = 1
+        try:
+            price = int(itm.get("price", 0))
+        except Exception:
+            price = 0
         subtotal = qty * price
         new_rows.append({
             "注文日時": now_str,
@@ -137,7 +152,9 @@ def save_order_items(channel, code, customer, zip_code, tel, address, delivery_d
     df_combined = pd.concat([df_existing, df_new], ignore_index=True)
     df_combined.to_csv(ORDERS_CSV, index=False, encoding="utf-8-sig")
 
+# --------------------------------------------------
 # セッション状態初期化
+# --------------------------------------------------
 if "current_order_fax" not in st.session_state:
     st.session_state.current_order_fax = None
 if "current_order_mail" not in st.session_state:
@@ -146,12 +163,16 @@ if "phone_cart" not in st.session_state:
     st.session_state.phone_cart = []
 
 def extract_order_info(input_data, is_image=False):
+    """Gemini AI解析処理"""
     if model is None:
-        st.error("APIキーが設定されていないか無効です。Streamlit Secretsを確認してください。")
+        st.error("APIキーが無効または初期化に失敗しています。Google AI Studioでキーを確認してください。")
         return None
+        
     system_prompt = """
     あなたは受発注伝票の解析アシスタントです。
     入力された情報（注文書画像またはメール本文）から、以下の情報を抽出し、必ずJSON形式のみで出力してください。
+    余分な解説やMarkdownフォーマットは含めず、純粋なJSONテキストのみを返してください。
+
     【出力フォーマット】
     {
       "customer_code": "顧客コード（不明なら空文字）",
@@ -159,9 +180,11 @@ def extract_order_info(input_data, is_image=False):
       "customer_zip": "郵便番号（不明なら空文字）",
       "customer_tel": "電話番号（不明なら空文字）",
       "customer_address": "住所（不明なら空文字）",
-      "items": [{"item_name": "商品名や品番", "quantity": 数値, "unit": "個/本/缶など"}],
+      "items": [
+        {"item_name": "商品名や品番", "quantity": 1, "unit": "個/本/缶など"}
+      ],
       "delivery_date": "希望納期（YYYY-MM-DD形式、不明なら空文字）",
-      "notes": "特記事項・備考"
+      "notes": "特記事項・署名・役職など"
     }
     """
     try:
@@ -169,8 +192,13 @@ def extract_order_info(input_data, is_image=False):
             response = model.generate_content([system_prompt, input_data])
         else:
             response = model.generate_content(f"{system_prompt}\n\n【対象テキスト】\n{input_data}")
-        text = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(text)
+        
+        raw_text = response.text.strip()
+        # マークダウン記法の除去
+        clean_text = re.sub(r"```json\s*", "", raw_text)
+        clean_text = re.sub(r"```\s*", "", clean_text).strip()
+        
+        return json.loads(clean_text)
     except Exception as e:
         st.error(f"AI解析エラー: {e}")
         return None
@@ -191,7 +219,7 @@ tab_fax, tab_mail, tab_phone, tab_list = st.tabs([
 ])
 
 # ==========================================
-# 1. FAX
+# 1. FAX（写真・スキャン）
 # ==========================================
 with tab_fax:
     st.subheader("FAX注文書の写真・スキャン取り込み")
@@ -236,11 +264,11 @@ with tab_fax:
             notes = st.text_area("備考", value=order.get("notes", ""), key="fax_notes")
             if st.button("✅ この内容で注文を確定・保存", key="btn_save_fax", type="primary"):
                 save_order_items("FAX", c_code, c_name, c_zip, c_tel, c_addr, d_date, fax_items_to_save, notes)
-                st.success("FAX注文を保存しました！一覧タブを確認してください。")
+                st.success("FAX注文を保存しました！「登録済み注文一覧」タブを確認してください。")
                 st.session_state.current_order_fax = None
 
 # ==========================================
-# 2. メール（解析 ＋ 確認・確定保存）
+# 2. メール（コピペ解析 ＆ 確認保存）
 # ==========================================
 with tab_mail:
     st.subheader("メール本文のコピペ解析 ＆ 登録")
@@ -254,7 +282,7 @@ with tab_mail:
         )
         if st.button("🤖 メールから注文内容を抽出", key="btn_mail_ai"):
             if mail_text:
-                with st.spinner("AI解析中..."):
+                with st.spinner("Geminiが解析中..."):
                     result = extract_order_info(mail_text, is_image=False)
                     if result:
                         st.session_state.current_order_mail = result
@@ -300,7 +328,7 @@ with tab_phone:
     
     st.markdown("#### 1. 顧客の検索・選択")
     col_cs1, col_cs2 = st.columns([2, 1])
-    cust_query = col_cs1.text_input("🔍 顧客検索（コード・社名・郵便番号・電話・住所の一部を入力）", placeholder="例: 井助、アタゴ、910、0776、坂井市 など", key="cust_search_query")
+    cust_query = col_cs1.text_input("🔍 顧客検索（コード・社名・郵便番号・電話・住所の一部を入力）", placeholder="例: ケーアイ、アタゴ、910、0776、坂井市 など", key="cust_search_query")
     req_date = col_cs2.date_input("希望納期", key="phone_date")
 
     if cust_query:
