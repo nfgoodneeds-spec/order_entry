@@ -7,14 +7,6 @@ from datetime import datetime
 import google.generativeai as genai
 from PIL import Image
 
-# PDF生成用ライブラリ
-from reportlab.lib.pagesizes import A4, landscape
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib import colors
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-
 # --------------------------------------------------
 # 初期設定
 # --------------------------------------------------
@@ -23,112 +15,27 @@ st.set_page_config(page_title="受発注DXタブレットアプリ", layout="wid
 CSV_FILE = "orders_data.csv"
 COLUMNS = ["注文日時", "受付種別", "顧客名", "電話番号", "住所", "品番", "品名", "数量", "単価", "小計", "希望納期", "備考"]
 
-# CSVを安全に読み込む関数（フォーマット不整合を自動修復）
+# CSVを安全に読み込む関数
 def load_orders_safe():
     if not os.path.exists(CSV_FILE):
         return pd.DataFrame(columns=COLUMNS)
     try:
-        df = pd.read_csv(CSV_FILE, encoding="utf-8-sig")
-        # 必要な列がすべて揃っているかチェック
+        df = pd.read_csv(CSV_FILE, encoding="utf-8-sig", dtype={"電話番号": str, "品番": str})
         if list(df.columns) != COLUMNS:
-            # 列が古い形式の場合は再初期化
             df = pd.DataFrame(columns=COLUMNS)
             df.to_csv(CSV_FILE, index=False, encoding="utf-8-sig")
         return df
     except Exception:
-        # 読み込みエラー（行ごとの列数ズレ等）が起きた場合は新規初期化
         df = pd.DataFrame(columns=COLUMNS)
         df.to_csv(CSV_FILE, index=False, encoding="utf-8-sig")
         return df
 
-# 日本語フォント登録（PDF用）
-try:
-    pdfmetrics.registerFont(UnicodeCIDFont('HeiseiKakuGo-W5'))
-except Exception:
-    pass
-
-# PDF帳票生成関数
-def generate_pdf_report(df):
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buffer, 
-        pagesize=landscape(A4),
-        rightMargin=20, leftMargin=20, topMargin=25, bottomMargin=25
-    )
-    elements = []
-    styles = getSampleStyleSheet()
-    
-    title_style = ParagraphStyle(
-        name='TitleStyle',
-        fontName='HeiseiKakuGo-W5',
-        fontSize=18,
-        leading=22,
-        alignment=1,
-        textColor=colors.HexColor('#1E293B')
-    )
-    meta_style = ParagraphStyle(
-        name='MetaStyle',
-        fontName='HeiseiKakuGo-W5',
-        fontSize=9,
-        leading=12,
-        alignment=2,
-        textColor=colors.HexColor('#64748B')
-    )
-    cell_style = ParagraphStyle(
-        name='CellStyle',
-        fontName='HeiseiKakuGo-W5',
-        fontSize=8,
-        leading=10,
-        textColor=colors.HexColor('#0F172A')
-    )
-    header_style = ParagraphStyle(
-        name='HeaderStyle',
-        fontName='HeiseiKakuGo-W5',
-        fontSize=8.5,
-        leading=11,
-        textColor=colors.whitesmoke,
-        alignment=1
-    )
-
-    elements.append(Paragraph("受 発 注 伝 票 一 覧 表", title_style))
-    elements.append(Spacer(1, 5))
-    elements.append(Paragraph(f"出力日時: {datetime.now().strftime('%Y年%m月%d日 %H:%M')}", meta_style))
-    elements.append(Spacer(1, 10))
-
-    headers = ["注文日時", "種別", "顧客名", "電話番号", "住所・納品先", "品番", "品名", "数量", "単価", "小計", "納期"]
-    table_data = [[Paragraph(h, header_style) for h in headers]]
-
-    for _, row in df.iterrows():
-        dt_str = str(row.get("注文日時", ""))[:16]
-        table_data.append([
-            Paragraph(dt_str, cell_style),
-            Paragraph(str(row.get("受付種別", "")), cell_style),
-            Paragraph(str(row.get("顧客名", "")), cell_style),
-            Paragraph(str(row.get("電話番号", "")), cell_style),
-            Paragraph(str(row.get("住所", "")), cell_style),
-            Paragraph(str(row.get("品番", "")), cell_style),
-            Paragraph(str(row.get("品名", "")), cell_style),
-            Paragraph(str(row.get("数量", "")), cell_style),
-            Paragraph(f"¥{int(row.get('単価', 0)):,}", cell_style),
-            Paragraph(f"¥{int(row.get('小計', 0)):,}", cell_style),
-            Paragraph(str(row.get("希望納期", "")), cell_style),
-        ])
-
-    col_widths = [75, 30, 85, 65, 140, 50, 110, 30, 45, 50, 60]
-    t = Table(table_data, colWidths=col_widths, repeatRows=1)
-    t.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1E293B')),
-        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#CBD5E1')),
-        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F8FAFC')]),
-        ('TOPPADDING', (0, 0), (-1, -1), 4),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-    ]))
-    elements.append(t)
-    doc.build(elements)
-    buffer.seek(0)
-    return buffer
+# Excel（.xlsx）生成関数
+def to_excel_bytes(df):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='受注データ一覧')
+    return output.getvalue()
 
 # 注文保存用の共通関数
 def save_order_items(channel, customer, tel, address, delivery_date, items, notes):
@@ -142,7 +49,7 @@ def save_order_items(channel, customer, tel, address, delivery_date, items, note
             "注文日時": now_str,
             "受付種別": channel,
             "顧客名": customer,
-            "電話番号": tel,
+            "電話番号": str(tel),
             "住所": address,
             "品番": itm.get("code", itm.get("item_code", "-")),
             "品名": itm.get("name", itm.get("item_name", "")),
@@ -153,8 +60,6 @@ def save_order_items(channel, customer, tel, address, delivery_date, items, note
             "備考": notes
         })
     df_new = pd.DataFrame(new_rows)
-    
-    # 既存データと安全に結合して保存
     df_existing = load_orders_safe()
     df_combined = pd.concat([df_existing, df_new], ignore_index=True)
     df_combined.to_csv(CSV_FILE, index=False, encoding="utf-8-sig")
@@ -337,7 +242,7 @@ with tab_phone:
                 st.session_state.phone_cart = []
                 st.rerun()
 
-# 4. 登録済み一覧（安全読み込み ＆ PDF・CSV出力）
+# 4. 登録済み一覧（Excel & CSV 出力対応）
 with tab_list:
     st.subheader("📋 登録済み注文一覧（最新データ）")
     
@@ -347,26 +252,25 @@ with tab_list:
         st.dataframe(df_orders, use_container_width=True)
         
         col_d1, col_d2, col_d3 = st.columns([2, 2, 1])
-        csv_data = df_orders.to_csv(index=False, encoding="utf_8_sig").encode("utf_8_sig")
         
+        # 1. Excel形式（.xlsx）ダウンロード
+        excel_bytes = to_excel_bytes(df_orders)
         col_d1.download_button(
-            label="📥 販売管理・配送連携用CSV",
+            label="📊 Excelファイル（.xlsx）を出力",
+            data=excel_bytes,
+            file_name=f"orders_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary"
+        )
+        
+        # 2. CSV形式（.csv）ダウンロード（基幹システム・販売管理取り込み用）
+        csv_data = df_orders.to_csv(index=False, encoding="utf_8_sig").encode("utf_8_sig")
+        col_d2.download_button(
+            label="📥 連携用CSVファイルを出力",
             data=csv_data,
             file_name=f"orders_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv",
         )
-        
-        try:
-            pdf_bytes = generate_pdf_report(df_orders)
-            col_d2.download_button(
-                label="🖨️ A4印刷用PDF帳票（全項目）を出力",
-                data=pdf_bytes,
-                file_name=f"order_report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-                mime="application/pdf",
-                type="primary"
-            )
-        except Exception as e:
-            col_d2.error(f"PDF生成エラー: {e}")
         
         if col_d3.button("🗑️ 全件クリア"):
             if os.path.exists(CSV_FILE):
