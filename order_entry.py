@@ -10,7 +10,7 @@ import google.generativeai as genai
 from PIL import Image, ImageEnhance, ImageOps
 
 # --------------------------------------------------
-# 初期設定（サイドバー非表示・全画面レイアウト）
+# 初期設定（全画面レイアウト）
 # --------------------------------------------------
 st.set_page_config(
     page_title="受発注DXタブレットアプリ", 
@@ -29,14 +29,13 @@ COLUMNS = [
 
 API_KEY = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
 
-# 文字列の全角/半角/大文字/小文字/特殊文字を正規化する関数
 def normalize_text(text):
     if text is None:
         return ""
     return unicodedata.normalize('NFKC', str(text)).lower().strip()
 
 # --------------------------------------------------
-# 画像前処理（スマホ回転補正・コントラスト強調）
+# 画像前処理
 # --------------------------------------------------
 def preprocess_image_for_ocr(img):
     try:
@@ -65,10 +64,12 @@ def load_customer_master():
         sample_df = pd.DataFrame([
             {"顧客コード": "1", "顧客名": "株式会社サンプル商事 本社", "郵便番号": "100-0005", "住所": "東京都千代田区丸の内1-1-1", "電話番号": "03-1234-5678"},
             {"顧客コード": "2", "顧客名": "株式会社サンプル商事 大阪支店", "郵便番号": "530-0001", "住所": "大阪府大阪市北区梅田2-2-2", "電話番号": "06-9876-5432"},
+            {"顧客コード": "3", "顧客名": "株式会社サンプル商事 新宿店", "郵便番号": "160-0022", "住所": "東京都新宿区新宿3-1-1", "電話番号": "03-3333-4444"},
         ])
         sample_df["_search_text"] = sample_df.apply(lambda r: " ".join([normalize_text(x) for x in r]), axis=1)
         sample_df["_clean_tel"] = sample_df["電話番号"].apply(lambda x: re.sub(r"\D", "", str(x)))
         sample_df["_norm_name"] = sample_df["顧客名"].apply(normalize_text)
+        sample_df["_norm_addr"] = sample_df["住所"].apply(normalize_text)
         return sample_df
 
     df_raw = None
@@ -80,7 +81,7 @@ def load_customer_master():
             continue
 
     if df_raw is None:
-        return pd.DataFrame(columns=["顧客コード", "顧客名", "郵便番号", "住所", "電話番号", "_search_text", "_clean_tel", "_norm_name"])
+        return pd.DataFrame(columns=["顧客コード", "顧客名", "郵便番号", "住所", "電話番号", "_search_text", "_clean_tel", "_norm_name", "_norm_addr"])
 
     try:
         header_row_idx = 0
@@ -114,7 +115,7 @@ def load_customer_master():
         else:
             result_df["住所"] = ""
             
-        result_df = result_df[result_df["顧客名"] != ""]
+        result_df = result_df[result_df["顧客名"] != ""].reset_index(drop=True)
         result_df = result_df[~result_df["顧客名"].str.contains("名称|得意先", na=False)].reset_index(drop=True)
         
         result_df["_search_text"] = result_df.apply(
@@ -123,10 +124,11 @@ def load_customer_master():
         )
         result_df["_clean_tel"] = result_df["電話番号"].apply(lambda x: re.sub(r"\D", "", str(x)))
         result_df["_norm_name"] = result_df["顧客名"].apply(normalize_text)
+        result_df["_norm_addr"] = result_df["住所"].apply(normalize_text)
         return result_df
     except Exception as e:
         st.warning(f"顧客マスタ処理注記: {e}")
-        return pd.DataFrame(columns=["顧客コード", "顧客名", "郵便番号", "住所", "電話番号", "_search_text", "_clean_tel", "_norm_name"])
+        return pd.DataFrame(columns=["顧客コード", "顧客名", "郵便番号", "住所", "電話番号", "_search_text", "_clean_tel", "_norm_name", "_norm_addr"])
 
 @st.cache_data(ttl=10)
 def load_item_master():
@@ -178,51 +180,67 @@ def load_item_master():
         st.warning(f"商品マスタ処理注記: {e}")
         return pd.DataFrame(columns=["品番", "品名", "品名索引", "単位", "標準単価", "_search_text"])
 
+# --------------------------------------------------
+# 複数支店・同名店舗を考慮したスマート名寄せ判定
+# --------------------------------------------------
 def match_customer_from_master(df_cust, extracted_dict):
-    """AIが抽出した情報から顧客マスタを自動探索して最も一致する顧客情報を返す"""
+    """電話番号・住所・支店名で絞り込み、複数候補がある場合は候補リストを保持"""
     if df_cust.empty or not extracted_dict:
         return extracted_dict
 
     code_raw = normalize_text(extracted_dict.get("customer_code", ""))
     tel_raw = re.sub(r"\D", "", normalize_text(extracted_dict.get("customer_tel", "")))
     name_raw = normalize_text(extracted_dict.get("customer_name", ""))
+    addr_raw = normalize_text(extracted_dict.get("customer_address", ""))
 
-    matched_row = None
+    candidates = pd.DataFrame()
 
-    # 1. 顧客コードで検索
+    # 1. 顧客コード完全一致
     if code_raw:
-        m = df_cust[df_cust["顧客コード"].apply(normalize_text) == code_raw]
-        if not m.empty:
-            matched_row = m.iloc[0]
+        c = df_cust[df_cust["顧客コード"].apply(normalize_text) == code_raw]
+        if not c.empty:
+            candidates = c
 
-    # 2. 電話番号で検索（ハイフン除去・下6桁以上一致）
-    if matched_row is None and len(tel_raw) >= 6:
-        m = df_cust[df_cust["_clean_tel"].str.contains(tel_raw, na=False)]
-        if not m.empty:
-            matched_row = m.iloc[0]
+    # 2. 電話番号一致（店舗ごとに固有のため最重要）
+    if candidates.empty and len(tel_raw) >= 6:
+        c = df_cust[df_cust["_clean_tel"].str.contains(tel_raw, na=False)]
+        if not c.empty:
+            candidates = c
 
-    # 3. 会社名・店舗名で検索（あいまい一致）
-    if matched_row is None and len(name_raw) >= 2:
-        # 完全部分一致
-        m = df_cust[df_cust["_norm_name"].str.contains(name_raw, na=False)]
-        if not m.empty:
-            matched_row = m.iloc[0]
-        else:
-            # 逆方向（マスタの社名が読み取りテキストに含まれるか）
-            for _, r in df_cust.iterrows():
+    # 3. 社名による検索（複数店舗ヒットする可能性あり）
+    if candidates.empty and len(name_raw) >= 2:
+        # 社名での部分一致
+        c = df_cust[df_cust["_norm_name"].str.contains(name_raw, na=False)]
+        if c.empty:
+            # 逆方向
+            matches_idx = []
+            for idx, r in df_cust.iterrows():
                 if len(r["_norm_name"]) >= 2 and (r["_norm_name"] in name_raw or name_raw in r["_norm_name"]):
-                    matched_row = r
-                    break
+                    matches_idx.append(idx)
+            if matches_idx:
+                c = df_cust.loc[matches_idx]
 
-    # マスタと一致した場合はマスタの正確な情報で上書き・補完
-    if matched_row is not None:
-        extracted_dict["customer_code"] = str(matched_row["顧客コード"])
-        extracted_dict["customer_name"] = str(matched_row["顧客名"])
-        extracted_dict["customer_zip"] = str(matched_row["郵便番号"])
-        extracted_dict["customer_tel"] = str(matched_row["電話番号"])
-        extracted_dict["customer_address"] = str(matched_row["住所"])
+        if not c.empty:
+            candidates = c
+            # 住所情報（大阪市、新宿区など）があればさらに絞り込み
+            if len(addr_raw) >= 2:
+                addr_filtered = c[c["_norm_addr"].apply(lambda a: any(kw in a for kw in [addr_raw, addr_raw[:4], addr_raw[:3]] if len(kw) >= 2))]
+                if not addr_filtered.empty:
+                    candidates = addr_filtered
+
+    # 結果のセット
+    if not candidates.empty:
+        extracted_dict["_candidate_list"] = candidates.to_dict("records")
+        # 1件目を選択（複数ある場合は画面上で切り替え可能）
+        best = candidates.iloc[0]
+        extracted_dict["customer_code"] = str(best["顧客コード"])
+        extracted_dict["customer_name"] = str(best["顧客名"])
+        extracted_dict["customer_zip"] = str(best["郵便番号"])
+        extracted_dict["customer_tel"] = str(best["電話番号"])
+        extracted_dict["customer_address"] = str(best["住所"])
         extracted_dict["_matched_from_master"] = True
     else:
+        extracted_dict["_candidate_list"] = []
         extracted_dict["_matched_from_master"] = False
 
     return extracted_dict
@@ -317,7 +335,7 @@ def on_customer_selected():
         st.session_state["phone_addr_final"] = ""
 
 # --------------------------------------------------
-# 高精度AI解析エンジン ＋ 顧客マスタ自動照合
+# AI解析エンジン
 # --------------------------------------------------
 def extract_order_info(input_data, is_image=False):
     if not API_KEY:
@@ -336,20 +354,20 @@ def extract_order_info(input_data, is_image=False):
 
     【読み取り時の最重要ルール】
     1. 【顧客情報】
-       - 「発注元」「貴社名」「御中」「得意先名」「送付元」などの欄から発注者会社名・店舗名を特定してください。
+       - 「発注元」「貴社名」「御中」「得意先名」「送付元」「店舗名」などの欄から発注者会社名・支店名を特定してください。
        - 郵便番号、住所、TEL、FAX番号、顧客コードがあれば正確に抽出してください。
     2. 【注文明細（商品・数量・単位）】
        - 表組み（品名、品番、数量、単位、単価）の各行を漏れなく抽出してください。
        - かすれや手書きの崩し文字がある場合、文脈や標準的な商品名（例: AK-35、BL-10、ホース、ノズル、パッキン等）から推測して補正してください。
-       - 数量が「1」や「2缶」「3本」「5個」などの場合、数量（数値）と単位（缶/本/個/台など）に正しく分離してください。
+       - 数量と単位（缶/本/個/台など）に正しく分離してください。
     3. 【希望納期・備考】
-       - 「納期」「着日」「配達希望日」「至急」「○月○日着」等の記述があればYYYY-MM-DD（または日付文字列）で抽出してください。
-       - 担当者名、特記事項、備考欄の記述は notes にまとめてください。
+       - 納期、至急等の指定があればYYYY-MM-DD（または日付文字列）で抽出してください。
+       - 担当者名、特記事項は notes にまとめてください。
 
     【出力フォーマット（純粋なJSONテキスト）】
     {
       "customer_code": "顧客コード（不明なら空文字）",
-      "customer_name": "顧客名・会社名（不明なら空文字）",
+      "customer_name": "顧客名・支店名（不明なら空文字）",
       "customer_zip": "郵便番号（不明なら空文字）",
       "customer_tel": "電話番号（不明なら空文字）",
       "customer_address": "住所（不明なら空文字）",
@@ -390,7 +408,6 @@ def extract_order_info(input_data, is_image=False):
             clean_text = re.sub(r"```\s*", "", clean_text).strip()
             parsed_json = json.loads(clean_text)
             
-            # 抽出結果を基幹顧客マスタと自動照合・補完
             df_cust = load_customer_master()
             enriched_json = match_customer_from_master(df_cust, parsed_json)
             return enriched_json
@@ -417,7 +434,7 @@ tab_fax, tab_mail, tab_phone, tab_list = st.tabs([
 ])
 
 # ==========================================
-# 1. FAX（写真・スキャン自動補正 ＆ マスタ自動名寄せ）
+# 1. FAX（写真・スキャン ＆ 複数支店選択）
 # ==========================================
 with tab_fax:
     st.subheader("FAX注文書の写真・スキャン取り込み")
@@ -426,9 +443,9 @@ with tab_fax:
         uploaded_file = st.file_uploader("注文書画像を選択（またはカメラ撮影）", type=["jpg", "jpeg", "png", "pdf"], key="fax_upload")
         if uploaded_file:
             img = Image.open(uploaded_file)
-            st.image(img, caption="アップロード画像（自動補正を適用して解析します）", use_container_width=True)
+            st.image(img, caption="アップロード画像", use_container_width=True)
             if st.button("🤖 AIで高精度読取を実行", key="btn_fax_ai", type="primary"):
-                with st.spinner("画像の向き補正・コントラスト強調・顧客マスタ自動照合中..."):
+                with st.spinner("画像の向き補正・コントラスト強調・顧客マスタ照合中..."):
                     result = extract_order_info(img, is_image=True)
                     if result:
                         st.session_state.current_order_fax = result
@@ -438,20 +455,49 @@ with tab_fax:
         st.subheader("📝 読取結果の確認・修正")
         if st.session_state.current_order_fax:
             order = st.session_state.current_order_fax
+            candidates = order.get("_candidate_list", [])
             
-            if order.get("_matched_from_master"):
+            # 複数店舗・支店が見つかった場合の選択UI
+            if len(candidates) > 1:
+                st.warning(f"⚠️ 同名・類似の店舗が **{len(candidates)} 件** 見つかりました。該当の支店を選択してください：")
+                cand_options = [
+                    f"【{c['顧客コード']}】 {c['顧客名']} ｜ 〒{c['郵便番号']} ｜ {c['住所']} ｜ TEL:{c['電話番号']}"
+                    for c in candidates
+                ]
+                selected_cand_str = st.selectbox("該当支店・店舗の選択", cand_options, key="fax_cand_select")
+                sel_cand_code = selected_cand_str.split("】")[0].replace("【", "").strip()
+                chosen = next((c for c in candidates if c["顧客コード"] == sel_cand_code), candidates[0])
+                
+                # 選択された店舗情報をセット
+                c_code_val = str(chosen["顧客コード"])
+                c_name_val = str(chosen["顧客名"])
+                c_zip_val = str(chosen["郵便番号"])
+                c_tel_val = str(chosen["電話番号"])
+                c_addr_val = str(chosen["住所"])
+            elif len(candidates) == 1:
                 st.success(f"🎯 顧客マスタと一致しました: **【{order.get('customer_code')}】 {order.get('customer_name')}**")
+                c_code_val = order.get("customer_code", "")
+                c_name_val = order.get("customer_name", "")
+                c_zip_val = order.get("customer_zip", "")
+                c_tel_val = order.get("customer_tel", "")
+                c_addr_val = order.get("customer_address", "")
+            else:
+                c_code_val = order.get("customer_code", "")
+                c_name_val = order.get("customer_name", "")
+                c_zip_val = order.get("customer_zip", "")
+                c_tel_val = order.get("customer_tel", "")
+                c_addr_val = order.get("customer_address", "")
             
             col_fc1, col_fc2 = st.columns([1, 2])
-            c_code = col_fc1.text_input("顧客コード", value=order.get("customer_code", ""), key="fax_ccode")
-            c_name = col_fc2.text_input("顧客名・会社名", value=order.get("customer_name", ""), key="fax_cname")
+            c_code = col_fc1.text_input("顧客コード", value=c_code_val, key="fax_ccode")
+            c_name = col_fc2.text_input("顧客名・会社名", value=c_name_val, key="fax_cname")
             
             col_f1, col_f2, col_f3 = st.columns([1, 1, 1])
-            c_zip = col_f1.text_input("郵便番号", value=order.get("customer_zip", ""), key="fax_zip")
-            c_tel = col_f2.text_input("電話番号", value=order.get("customer_tel", ""), key="fax_tel")
+            c_zip = col_f1.text_input("郵便番号", value=c_zip_val, key="fax_zip")
+            c_tel = col_f2.text_input("電話番号", value=c_tel_val, key="fax_tel")
             d_date = col_f3.text_input("希望納期", value=order.get("delivery_date", ""), key="fax_ddate")
             
-            c_addr = st.text_input("住所・納品先", value=order.get("customer_address", ""), key="fax_addr")
+            c_addr = st.text_input("住所・納品先", value=c_addr_val, key="fax_addr")
             
             st.write("▼ 注文明細")
             items = order.get("items", [])
@@ -470,7 +516,7 @@ with tab_fax:
                 st.session_state.current_order_fax = None
 
 # ==========================================
-# 2. メール（コピペ解析 ＆ マスタ自動名寄せ）
+# 2. メール（コピペ解析 ＆ 複数支店選択）
 # ==========================================
 with tab_mail:
     st.subheader("メール本文のコピペ解析 ＆ 登録")
@@ -484,7 +530,7 @@ with tab_mail:
         )
         if st.button("🤖 メールから注文内容を抽出", key="btn_mail_ai"):
             if mail_text:
-                with st.spinner("Gemini解析 ＆ 顧客マスタ自動照合中..."):
+                with st.spinner("Gemini解析 ＆ 顧客マスタ照合中..."):
                     result = extract_order_info(mail_text, is_image=False)
                     if result:
                         st.session_state.current_order_mail = result
@@ -494,20 +540,47 @@ with tab_mail:
         st.subheader("📝 抽出結果の確認・修正")
         if st.session_state.current_order_mail:
             m_order = st.session_state.current_order_mail
+            m_candidates = m_order.get("_candidate_list", [])
             
-            if m_order.get("_matched_from_master"):
+            if len(m_candidates) > 1:
+                st.warning(f"⚠️ 同名・類似の店舗が **{len(m_candidates)} 件** 見つかりました。該当の支店を選択してください：")
+                m_cand_options = [
+                    f"【{c['顧客コード']}】 {c['顧客名']} ｜ 〒{c['郵便番号']} ｜ {c['住所']} ｜ TEL:{c['電話番号']}"
+                    for c in m_candidates
+                ]
+                m_selected_cand_str = st.selectbox("該当支店・店舗の選択", m_cand_options, key="mail_cand_select")
+                m_sel_cand_code = m_selected_cand_str.split("】")[0].replace("【", "").strip()
+                m_chosen = next((c for c in m_candidates if c["顧客コード"] == m_sel_cand_code), m_candidates[0])
+                
+                m_code_val = str(m_chosen["顧客コード"])
+                m_name_val = str(m_chosen["顧客名"])
+                m_zip_val = str(m_chosen["郵便番号"])
+                m_tel_val = str(m_chosen["電話番号"])
+                m_addr_val = str(m_chosen["住所"])
+            elif len(m_candidates) == 1:
                 st.success(f"🎯 顧客マスタと一致しました: **【{m_order.get('customer_code')}】 {m_order.get('customer_name')}**")
+                m_code_val = m_order.get("customer_code", "")
+                m_name_val = m_order.get("customer_name", "")
+                m_zip_val = m_order.get("customer_zip", "")
+                m_tel_val = m_order.get("customer_tel", "")
+                m_addr_val = m_order.get("customer_address", "")
+            else:
+                m_code_val = m_order.get("customer_code", "")
+                m_name_val = m_order.get("customer_name", "")
+                m_zip_val = m_order.get("customer_zip", "")
+                m_tel_val = m_order.get("customer_tel", "")
+                m_addr_val = m_order.get("customer_address", "")
             
             col_mc1, col_mc2 = st.columns([1, 2])
-            m_code = col_mc1.text_input("顧客コード", value=m_order.get("customer_code", ""), key="mail_ccode")
-            m_name = col_mc2.text_input("顧客名・会社名", value=m_order.get("customer_name", ""), key="mail_cname")
+            m_code = col_mc1.text_input("顧客コード", value=m_code_val, key="mail_ccode")
+            m_name = col_mc2.text_input("顧客名・会社名", value=m_name_val, key="mail_cname")
             
             col_mf1, col_mf2, col_mf3 = st.columns([1, 1, 1])
-            m_zip = col_mf1.text_input("郵便番号", value=m_order.get("customer_zip", ""), key="mail_zip")
-            m_tel = col_mf2.text_input("電話番号", value=m_order.get("customer_tel", ""), key="mail_tel")
+            m_zip = col_mf1.text_input("郵便番号", value=m_zip_val, key="mail_zip")
+            m_tel = col_mf2.text_input("電話番号", value=m_tel_val, key="mail_tel")
             m_ddate = col_mf3.text_input("希望納期", value=m_order.get("delivery_date", ""), key="mail_ddate")
             
-            m_addr = st.text_input("住所・納品先", value=m_order.get("customer_address", ""), key="mail_addr")
+            m_addr = st.text_input("住所・納品先", value=m_addr_val, key="mail_addr")
             
             st.write("▼ 注文明細")
             m_items = m_order.get("items", [])
