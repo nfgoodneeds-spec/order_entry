@@ -33,11 +33,11 @@ with st.sidebar:
     )
 
 # --------------------------------------------------
-# マスタデータの読み込み（ヘッダー行完全対応）
+# マスタデータの読み込み
 # --------------------------------------------------
 @st.cache_data(ttl=10)
 def load_customer_master():
-    """顧客マスタCSVの読み込み（基幹システムヘッダー補正・文字コード自動判別）"""
+    """顧客マスタCSVの読み込み"""
     if not os.path.exists(CUSTOMERS_CSV):
         return pd.DataFrame([
             {"顧客コード": "1", "顧客名": "株式会社サンプル商事 本社", "郵便番号": "100-0005", "住所": "東京都千代田区丸の内1-1-1", "電話番号": "03-1234-5678"},
@@ -56,7 +56,6 @@ def load_customer_master():
         return pd.DataFrame(columns=["顧客コード", "顧客名", "郵便番号", "住所", "電話番号"])
 
     try:
-        # 正しいヘッダー行（得意先ｺｰﾄﾞ や 得意先名称 が含まれる行）を厳密に特定
         header_row_idx = 0
         for idx, row in df_raw.head(10).iterrows():
             row_str = " ".join(row.dropna().astype(str))
@@ -68,7 +67,6 @@ def load_customer_master():
         df = df_raw.iloc[header_row_idx + 1:].copy()
         df.columns = header_cols
 
-        # 各列を正確に抽出
         code_col = next((c for c in df.columns if "ｺｰﾄﾞ" in c or "コード" in c), df.columns[0])
         name_col = next((c for c in df.columns if "名称" in c or "名" in c), df.columns[1])
         zip_col = next((c for c in df.columns if "郵便" in c), None)
@@ -89,7 +87,6 @@ def load_customer_master():
         else:
             result_df["住所"] = ""
             
-        # 不要なヘッダー再混入や空行を除外
         result_df = result_df[result_df["顧客名"] != ""]
         result_df = result_df[~result_df["顧客名"].str.contains("名称|得意先", na=False)]
         return result_df.reset_index(drop=True)
@@ -170,13 +167,41 @@ def save_order_items(channel, code, customer, zip_code, tel, address, delivery_d
     df_combined = pd.concat([df_existing, df_new], ignore_index=True)
     df_combined.to_csv(ORDERS_CSV, index=False, encoding="utf-8-sig")
 
+# --------------------------------------------------
 # セッション状態初期化
+# --------------------------------------------------
 if "current_order_fax" not in st.session_state:
     st.session_state.current_order_fax = None
 if "current_order_mail" not in st.session_state:
     st.session_state.current_order_mail = None
 if "phone_cart" not in st.session_state:
     st.session_state.phone_cart = []
+
+# 電話受付用入力欄の初期化
+for k in ["phone_cust_code_final", "phone_cust_name_final", "phone_zip_final", "phone_tel_final", "phone_addr_final"]:
+    if k not in st.session_state:
+        st.session_state[k] = ""
+
+def on_customer_selected():
+    """候補が選択された時に各入力欄の値を即座に書き換えるコールバック"""
+    sel_val = st.session_state.get("selected_cust_dropdown", "")
+    df_cust = load_customer_master()
+    if sel_val and sel_val != "新規または手入力":
+        sel_code = sel_val.split("】")[0].replace("【", "").strip()
+        matched = df_cust[df_cust["顧客コード"] == sel_code]
+        if not matched.empty:
+            row = matched.iloc[0]
+            st.session_state["phone_cust_code_final"] = str(row["顧客コード"])
+            st.session_state["phone_cust_name_final"] = str(row["顧客名"])
+            st.session_state["phone_zip_final"] = str(row["郵便番号"])
+            st.session_state["phone_tel_final"] = str(row["電話番号"])
+            st.session_state["phone_addr_final"] = str(row["住所"])
+    elif sel_val == "新規または手入力":
+        st.session_state["phone_cust_code_final"] = ""
+        st.session_state["phone_cust_name_final"] = ""
+        st.session_state["phone_zip_final"] = ""
+        st.session_state["phone_tel_final"] = ""
+        st.session_state["phone_addr_final"] = ""
 
 def extract_order_info(input_data, is_image=False):
     if not api_key_input:
@@ -353,14 +378,14 @@ with tab_mail:
                 st.session_state.current_order_mail = None
                 st.rerun()
 
-# 3. 電話
+# 3. 電話（顧客コード・社名・郵便・電話・住所を完全自動反映）
 with tab_phone:
     st.subheader("📞 電話受付 - 顧客・商品検索と明細登録")
     st.caption(f"※ 顧客マスタ読み込み件数: **{len(df_cust_master):,}** 件")
     
     st.markdown("#### 1. 顧客の検索・選択")
     col_cs1, col_cs2 = st.columns([2, 1])
-    cust_query = col_cs1.text_input("🔍 顧客検索（コード・社名・郵便番号・電話・住所の一部を入力）", placeholder="例: ケーアイ、アタゴ、910、0776、坂井市 など", key="cust_search_query")
+    cust_query = col_cs1.text_input("🔍 顧客検索（コード・社名・郵便番号・電話・住所の一部を入力）", placeholder="例: 創美、アタゴ、910、0776、館林市 など", key="cust_search_query")
     req_date = col_cs2.date_input("希望納期", key="phone_date")
 
     if cust_query:
@@ -379,35 +404,21 @@ with tab_phone:
         for _, row in matched_cust.iterrows()
     ]
 
-    selected_cust_str = st.selectbox(
+    st.selectbox(
         f"検索結果候補（該当 {len(matched_cust)} 件）", 
         cust_options, 
-        key="selected_cust_dropdown"
+        key="selected_cust_dropdown",
+        on_change=on_customer_selected
     )
 
-    if selected_cust_str != "新規または手入力":
-        sel_code = selected_cust_str.split("】")[0].replace("【", "").strip()
-        matched_rows = df_cust_master[df_cust_master["顧客コード"] == sel_code]
-        if not matched_rows.empty:
-            row_match = matched_rows.iloc[0]
-            init_code = str(row_match["顧客コード"])
-            init_name = str(row_match["顧客名"])
-            init_zip = str(row_match["郵便番号"])
-            init_tel = str(row_match["電話番号"])
-            init_addr = str(row_match["住所"])
-        else:
-            init_code = init_name = init_zip = init_tel = init_addr = ""
-    else:
-        init_code = init_name = init_zip = init_tel = init_addr = ""
-
     col_info1, col_info2 = st.columns([1, 3])
-    cust_code_final = col_info1.text_input("顧客コード", value=init_code, key="phone_cust_code_final")
-    cust_name_final = col_info2.text_input("顧客名（確定・編集可）", value=init_name, key="phone_cust_name_final")
+    cust_code_final = col_info1.text_input("顧客コード", key="phone_cust_code_final")
+    cust_name_final = col_info2.text_input("顧客名（確定・編集可）", key="phone_cust_name_final")
     
     col_info3, col_info4, col_info5 = st.columns([1, 1, 2])
-    cust_zip_final = col_info3.text_input("郵便番号", value=init_zip, key="phone_zip_final")
-    cust_tel_final = col_info4.text_input("電話番号", value=init_tel, key="phone_tel_final")
-    cust_addr_final = col_info5.text_input("住所・納品先", value=init_addr, key="phone_addr_final")
+    cust_zip_final = col_info3.text_input("郵便番号", key="phone_zip_final")
+    cust_tel_final = col_info4.text_input("電話番号", key="phone_tel_final")
+    cust_addr_final = col_info5.text_input("住所・納品先", key="phone_addr_final")
 
     st.markdown("---")
     st.markdown("#### 2. 商品の検索・カート追加")
