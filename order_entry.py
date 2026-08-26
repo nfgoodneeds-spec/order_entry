@@ -96,11 +96,11 @@ def load_customer_master():
 
 @st.cache_data(ttl=10)
 def load_item_master():
-    """商品マスタCSVの読み込み"""
+    """商品マスタCSVの読み込み（基幹新CSV対応・売上単価/ランク単価自動取得）"""
     if not os.path.exists(ITEMS_CSV):
         return pd.DataFrame([
-            {"品番": "500102", "品名": "溶剤 AK-35", "品名索引": "AK-35", "単位": "缶", "標準単価": 17500},
-            {"品番": "100002", "品名": "BL-10", "品名索引": "BL-10", "単位": "台", "標準単価": 45000},
+            {"品番": "500102", "品名": "溶剤 AK-35", "品名索引": "AK-35", "単位": "缶", "標準単価": 26000},
+            {"品番": "100002", "品名": "BL-10", "品名索引": "BL-10", "単位": "台", "標準単価": 50000},
         ])
 
     df = None
@@ -119,7 +119,7 @@ def load_item_master():
         name_col = next((c for c in df.columns if ("商品名" in c or "品名" in c) and "索引" not in c), df.columns[1])
         index_col = next((c for c in df.columns if "索引" in c or "略称" in c), None)
         unit_col = next((c for c in df.columns if "単位" in c), None)
-        price_col = next((c for c in df.columns if "単価" in c or "価格" in c or "上代" in c), None)
+        price_col = next((c for c in df.columns if "単価" in c or "価格" in c or "上代" in c or "ﾗﾝｸ" in c or "ランク" in c), None)
 
         res_df = pd.DataFrame()
         res_df["品番"] = df[code_col].fillna("").astype(str).str.strip()
@@ -203,19 +203,10 @@ if "current_order_mail" not in st.session_state:
 if "phone_cart" not in st.session_state:
     st.session_state.phone_cart = []
 
-# 入力欄のセッション保持
 for k in ["phone_cust_code_final", "phone_cust_name_final", "phone_zip_final", "phone_tel_final", "phone_addr_final"]:
     if k not in st.session_state:
         st.session_state[k] = ""
 
-if "add_qty" not in st.session_state:
-    st.session_state["add_qty"] = 1
-if "add_unit" not in st.session_state:
-    st.session_state["add_unit"] = "個"
-if "add_price" not in st.session_state:
-    st.session_state["add_price"] = 0
-
-# 顧客選択時のコールバック
 def on_customer_selected():
     sel_val = st.session_state.get("selected_cust_dropdown", "")
     df_cust = load_customer_master()
@@ -235,18 +226,6 @@ def on_customer_selected():
         st.session_state["phone_zip_final"] = ""
         st.session_state["phone_tel_final"] = ""
         st.session_state["phone_addr_final"] = ""
-
-# 商品選択時のコールバック（単位・単価を即時更新）
-def on_item_selected():
-    sel_val = st.session_state.get("selected_item_dropdown", "")
-    df_items = load_item_master()
-    if sel_val:
-        sel_code = sel_val.split("】")[0].replace("【", "").strip()
-        matched = df_items[df_items["品番"].astype(str) == sel_code]
-        if not matched.empty:
-            row = matched.iloc[0]
-            st.session_state["add_unit"] = str(row["単位"])
-            st.session_state["add_price"] = int(row["標準単価"])
 
 def extract_order_info(input_data, is_image=False):
     if not api_key_input:
@@ -423,7 +402,7 @@ with tab_mail:
                 st.session_state.current_order_mail = None
                 st.rerun()
 
-# 3. 電話（顧客・商品マスタ1万件完全連動）
+# 3. 電話（商品・単価・単位 完全連動）
 with tab_phone:
     st.subheader("📞 電話受付 - 顧客・商品検索と明細登録")
     col_stat1, col_stat2 = st.columns(2)
@@ -471,7 +450,7 @@ with tab_phone:
     st.markdown("#### 2. 商品の検索・カート追加")
     
     col_is1, col_is2 = st.columns([2, 3])
-    item_query = col_is1.text_input("🔍 商品検索（コード・商品名・略称の一部を入力）", placeholder="例: AK-35、BL-10、ノズル、ホース など", key="item_search_query")
+    item_query = col_is1.text_input("🔍 商品検索（コード・商品名・略称の一部を入力）", placeholder="例: AK、BL、500102、ホース など", key="item_search_query")
     
     if item_query:
         matched_items = df_items_master[
@@ -483,35 +462,29 @@ with tab_phone:
         matched_items = df_items_master.head(50)
 
     item_options = [
-        f"【{row['品番']}】 {row['品名']} ｜ 単位: {row['単位']} ｜ 上代: ¥{int(row['標準単価']):,}"
+        f"【{row['品番']}】 {row['品名']} ｜ 単位: {row['単位']} ｜ 単価: ¥{int(row['標準単価']):,}"
         for _, row in matched_items.iterrows()
     ]
-
-    # 初回初期値の安全セット
-    if "selected_item_dropdown" not in st.session_state and item_options:
-        first_opt = item_options[0]
-        first_code = first_opt.split("】")[0].replace("【", "").strip()
-        first_matched = df_items_master[df_items_master["品番"].astype(str) == first_code]
-        if not first_matched.empty:
-            st.session_state["add_unit"] = str(first_matched.iloc[0]["単位"])
-            st.session_state["add_price"] = int(first_matched.iloc[0]["標準単価"])
 
     if item_options:
         selected_item_str = col_is2.selectbox(
             f"商品候補（該当 {len(matched_items)} 件）", 
             item_options, 
-            key="selected_item_dropdown",
-            on_change=on_item_selected
+            key=f"item_select_box_{item_query}"
         )
         
+        # 選択中の商品から確実にコード・品名・単位・単価をリアルタイム抽出
         selected_code = selected_item_str.split("】")[0].replace("【", "").strip()
         item_row = df_items_master[df_items_master["品番"].astype(str) == selected_code].iloc[0]
         selected_name = str(item_row["品名"])
+        auto_unit = str(item_row["単位"])
+        auto_price = int(item_row["標準単価"])
 
         col_p1, col_p2, col_p3, col_p4 = st.columns([1, 1, 1, 1])
-        qty = col_p1.number_input("数量", min_value=1, key="add_qty")
-        item_unit_input = col_p2.text_input("単位", key="add_unit")
-        unit_price = col_p3.number_input("単価（円）", step=100, key="add_price")
+        # 商品が変わるごとに動的キーで初期値を連動
+        qty = col_p1.number_input("数量", min_value=1, value=1, key=f"qty_{selected_code}")
+        item_unit_input = col_p2.text_input("単位", value=auto_unit, key=f"unit_{selected_code}")
+        unit_price = col_p3.number_input("単価（円）", value=auto_price, step=100, key=f"price_{selected_code}")
         
         with col_p4:
             st.write("")
