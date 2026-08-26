@@ -22,7 +22,6 @@ COLUMNS = [
     "住所", "電話番号", "品番", "品名", "数量", "単価", "小計", "希望納期", "備考"
 ]
 
-# サイドバーでAPIキーを受け取る（コード内には直接秘密情報を書かない安全設計）
 with st.sidebar:
     st.header("⚙️ 設定")
     secret_key = st.secrets.get("GEMINI_API_KEY", "")
@@ -32,15 +31,6 @@ with st.sidebar:
         type="password",
         placeholder="AI Studioで取得したAPIキーを入力"
     )
-
-def get_gemini_model(key):
-    if not key:
-        return None
-    try:
-        genai.configure(api_key=key.strip())
-        return genai.GenerativeModel("gemini-1.5-flash")
-    except Exception:
-        return None
 
 # --------------------------------------------------
 # マスタデータの読み込み
@@ -171,12 +161,17 @@ if "phone_cart" not in st.session_state:
     st.session_state.phone_cart = []
 
 def extract_order_info(input_data, is_image=False):
-    """Gemini AI解析処理"""
-    active_model = get_gemini_model(api_key_input)
-    if active_model is None:
+    """利用可能なGeminiモデルを自動検出してAI解析を実行"""
+    if not api_key_input:
         st.error("左側サイドバーにGemini APIキーを入力してください。")
         return None
         
+    try:
+        genai.configure(api_key=api_key_input.strip())
+    except Exception as e:
+        st.error(f"APIキー設定エラー: {e}")
+        return None
+
     system_prompt = """
     あなたは受発注伝票の解析アシスタントです。
     入力された情報（注文書画像またはメール本文）から、以下の情報を抽出し、必ずJSON形式のみで出力してください。
@@ -196,20 +191,35 @@ def extract_order_info(input_data, is_image=False):
       "notes": "特記事項・署名・役職など"
     }
     """
-    try:
-        if is_image:
-            response = active_model.generate_content([system_prompt, input_data])
-        else:
-            response = active_model.generate_content(f"{system_prompt}\n\n【対象テキスト】\n{input_data}")
-        
-        raw_text = response.text.strip()
-        clean_text = re.sub(r"```json\s*", "", raw_text)
-        clean_text = re.sub(r"```\s*", "", clean_text).strip()
-        
-        return json.loads(clean_text)
-    except Exception as e:
-        st.error(f"AI解析エラー: {e}")
-        return None
+    
+    # 利用可能なモデル候補を順にトライ
+    candidate_models = [
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-pro",
+        "gemini-pro" if not is_image else "gemini-pro-vision"
+    ]
+
+    last_error = None
+    for model_name in candidate_models:
+        try:
+            m = genai.GenerativeModel(model_name)
+            if is_image:
+                response = m.generate_content([system_prompt, input_data])
+            else:
+                response = m.generate_content(f"{system_prompt}\n\n【対象テキスト】\n{input_data}")
+            
+            raw_text = response.text.strip()
+            clean_text = re.sub(r"```json\s*", "", raw_text)
+            clean_text = re.sub(r"```\s*", "", clean_text).strip()
+            return json.loads(clean_text)
+        except Exception as e:
+            last_error = e
+            continue
+
+    st.error(f"AI解析エラー: {last_error}")
+    return None
 
 # --------------------------------------------------
 # UI画面構成
