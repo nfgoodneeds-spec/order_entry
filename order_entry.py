@@ -9,7 +9,7 @@ import google.generativeai as genai
 from PIL import Image
 
 # --------------------------------------------------
-# 初期設定 & サイドバーでのAPIキー設定
+# 初期設定 & サイドバー設定
 # --------------------------------------------------
 st.set_page_config(page_title="受発注DXタブレットアプリ", layout="wide")
 
@@ -22,24 +22,25 @@ COLUMNS = [
     "住所", "電話番号", "品番", "品名", "数量", "単価", "小計", "希望納期", "備考"
 ]
 
-# サイドバーでAPIキーの入力・確認が可能
+# サイドバーでAPIキーを受け取る（コード内には直接秘密情報を書かない安全設計）
 with st.sidebar:
     st.header("⚙️ 設定")
     secret_key = st.secrets.get("GEMINI_API_KEY", "")
     api_key_input = st.text_input(
-        "Gemini API Key（AIzaSy...）", 
+        "Gemini API Key", 
         value=secret_key, 
         type="password",
-        help="Google AI Studioで取得した 'AIzaSy' から始まるキーを入力してください"
+        placeholder="AI Studioで取得したAPIキーを入力"
     )
 
-model = None
-if api_key_input:
+def get_gemini_model(key):
+    if not key:
+        return None
     try:
-        genai.configure(api_key=api_key_input.strip())
-        model = genai.GenerativeModel("gemini-1.5-flash")
-    except Exception as e:
-        st.sidebar.error(f"キー初期化エラー: {e}")
+        genai.configure(api_key=key.strip())
+        return genai.GenerativeModel("gemini-1.5-flash")
+    except Exception:
+        return None
 
 # --------------------------------------------------
 # マスタデータの読み込み
@@ -171,8 +172,9 @@ if "phone_cart" not in st.session_state:
 
 def extract_order_info(input_data, is_image=False):
     """Gemini AI解析処理"""
-    if model is None:
-        st.error("左側サイドバーに有効なGemini APIキー（AIzaSy...）を入力してください。")
+    active_model = get_gemini_model(api_key_input)
+    if active_model is None:
+        st.error("左側サイドバーにGemini APIキーを入力してください。")
         return None
         
     system_prompt = """
@@ -196,9 +198,9 @@ def extract_order_info(input_data, is_image=False):
     """
     try:
         if is_image:
-            response = model.generate_content([system_prompt, input_data])
+            response = active_model.generate_content([system_prompt, input_data])
         else:
-            response = model.generate_content(f"{system_prompt}\n\n【対象テキスト】\n{input_data}")
+            response = active_model.generate_content(f"{system_prompt}\n\n【対象テキスト】\n{input_data}")
         
         raw_text = response.text.strip()
         clean_text = re.sub(r"```json\s*", "", raw_text)
@@ -224,9 +226,7 @@ tab_fax, tab_mail, tab_phone, tab_list = st.tabs([
     "📋 登録済み注文一覧"
 ])
 
-# ==========================================
-# 1. FAX（写真・スキャン）
-# ==========================================
+# 1. FAX
 with tab_fax:
     st.subheader("FAX注文書の写真・スキャン取り込み")
     col1, col2 = st.columns([1, 1])
@@ -273,9 +273,7 @@ with tab_fax:
                 st.success("FAX注文を保存しました！「登録済み注文一覧」タブを確認してください。")
                 st.session_state.current_order_fax = None
 
-# ==========================================
-# 2. メール（コピペ解析 ＆ 確認保存）
-# ==========================================
+# 2. メール
 with tab_mail:
     st.subheader("メール本文のコピペ解析 ＆ 登録")
     col_m1, col_m2 = st.columns([1, 1])
@@ -326,9 +324,7 @@ with tab_mail:
                 st.session_state.current_order_mail = None
                 st.rerun()
 
-# ==========================================
-# 3. 電話（顧客・商品 部分一致検索）
-# ==========================================
+# 3. 電話
 with tab_phone:
     st.subheader("📞 電話受付 - 顧客・商品検索と明細登録")
     
@@ -455,9 +451,7 @@ with tab_phone:
     else:
         st.info("商品を選択して「＋ 明細に追加」を押してください。")
 
-# ==========================================
 # 4. 登録済み一覧
-# ==========================================
 with tab_list:
     st.subheader("📋 登録済み注文一覧（最新データ）")
     
