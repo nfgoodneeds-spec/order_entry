@@ -192,17 +192,21 @@ def extract_order_info(input_data, is_image=False):
     }
     """
     
-    # 利用可能なモデル候補を順にトライ
-    candidate_models = [
-        "gemini-1.5-flash-latest",
-        "gemini-1.5-flash",
-        "gemini-2.0-flash",
-        "gemini-1.5-pro",
-        "gemini-pro" if not is_image else "gemini-pro-vision"
-    ]
+    # 1. まずアカウントで利用可能なモデル一覧を動的に取得
+    valid_models = []
+    try:
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                valid_models.append(m.name)
+    except Exception:
+        pass
+
+    # 2. 優先的に試すモデル候補
+    if not valid_models:
+        valid_models = ["models/gemini-1.5-flash", "models/gemini-2.0-flash", "models/gemini-1.5-pro", "gemini-1.5-flash"]
 
     last_error = None
-    for model_name in candidate_models:
+    for model_name in valid_models:
         try:
             m = genai.GenerativeModel(model_name)
             if is_image:
