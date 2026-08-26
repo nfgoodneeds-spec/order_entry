@@ -13,15 +13,8 @@ st.set_page_config(page_title="受発注DXタブレットアプリ", layout="wid
 
 CSV_FILE = "orders_data.csv"
 
-# CSVファイルの初期化（存在しない場合は作成）
-if not os.path.exists(CSV_FILE):
-    df_init = pd.DataFrame(columns=[
-        "注文日時", "受付種別", "顧客名", "品番", "品名", "数量", "単価", "小計", "希望納期", "備考"
-    ])
-    df_init.to_csv(CSV_FILE, index=False, encoding="utf-8-sig")
-
 # 注文保存用の共通関数
-def save_order_items(channel, customer, delivery_date, items, notes):
+def save_order_items(channel, customer, tel, address, delivery_date, items, notes):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     new_rows = []
     for itm in items:
@@ -32,6 +25,8 @@ def save_order_items(channel, customer, delivery_date, items, notes):
             "注文日時": now_str,
             "受付種別": channel,
             "顧客名": customer,
+            "電話番号": tel,
+            "住所": address,
             "品番": itm.get("code", itm.get("item_code", "-")),
             "品名": itm.get("name", itm.get("item_name", "")),
             "数量": qty,
@@ -41,7 +36,11 @@ def save_order_items(channel, customer, delivery_date, items, notes):
             "備考": notes
         })
     df_new = pd.DataFrame(new_rows)
-    df_new.to_csv(CSV_FILE, mode="a", header=not os.path.exists(CSV_FILE), index=False, encoding="utf-8-sig")
+    # CSVが存在しない場合はヘッダー付き、存在する場合は追記
+    if not os.path.exists(CSV_FILE):
+        df_new.to_csv(CSV_FILE, index=False, encoding="utf-8-sig")
+    else:
+        df_new.to_csv(CSV_FILE, mode="a", header=False, index=False, encoding="utf-8-sig")
 
 # APIキー設定
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
@@ -54,10 +53,33 @@ ITEM_MASTER = {
     "A-101": {"name": "超音波ノズル先端部品", "price": 12000},
     "A-102": {"name": "高圧ホース 3m", "price": 8500},
     "B-201": {"name": "専用洗浄溶剤 5L", "price": 4500},
-    "B-202": {"皮革用リカラー染料（ブラック）": "皮革用リカラー染料（ブラック）", "name": "皮革用リカラー染料（ブラック）", "price": 3200},
+    "B-202": {"name": "皮革用リカラー染料（ブラック）", "price": 3200},
     "C-301": {"name": "交換用パッキンセット", "price": 1500},
 }
-CUSTOMER_LIST = ["株式会社サンプル商事", "東京リユース工業", "埼玉メンテナンス", "その他（新規）"]
+
+# 顧客マスタ（顧客名: {電話番号, 住所}）
+CUSTOMER_MASTER = {
+    "株式会社サンプル商事 本社": {
+        "tel": "03-1234-5678",
+        "address": "東京都千代田区丸の内1-1-1"
+    },
+    "株式会社サンプル商事 大阪支店": {
+        "tel": "06-9876-5432",
+        "address": "大阪府大阪市北区梅田2-2-2"
+    },
+    "東京リユース工業": {
+        "tel": "03-3333-4444",
+        "address": "東京都大田区羽田旭町3-3"
+    },
+    "埼玉メンテナンス": {
+        "tel": "048-555-6666",
+        "address": "埼玉県さいたま市大宮区桜木町4-4"
+    },
+    "その他（新規入力）": {
+        "tel": "",
+        "address": ""
+    }
+}
 
 # セッション状態の初期化
 if "current_order" not in st.session_state:
@@ -66,7 +88,7 @@ if "phone_cart" not in st.session_state:
     st.session_state.phone_cart = []
 
 # --------------------------------------------------
-# AI抽出用関数
+# AI抽出用関数（住所・電話番号の抽出を追加）
 # --------------------------------------------------
 def extract_order_info(input_data, is_image=False):
     system_prompt = """
@@ -75,7 +97,9 @@ def extract_order_info(input_data, is_image=False):
     
     【出力フォーマット】
     {
-      "customer_name": "顧客名（不明なら空文字）",
+      "customer_name": "顧客名・会社名（不明なら空文字）",
+      "customer_tel": "電話番号（不明なら空文字）",
+      "customer_address": "納品先住所または会社住所（不明なら空文字）",
       "items": [
         {"item_name": "商品名や品番", "quantity": 数値, "unit": "個/本など"}
       ],
@@ -121,7 +145,7 @@ with tab_fax:
             st.image(img, caption="アップロードされた注文書", use_container_width=True)
             
             if st.button("🤖 AIで自動読取を実行", key="btn_fax_ai"):
-                with st.spinner("Geminiが手書き・活字を解析中..."):
+                with st.spinner("Geminiが手書き・活字（会社名・住所・電話・明細）を解析中..."):
                     result = extract_order_info(img, is_image=True)
                     if result:
                         st.session_state.current_order = result
@@ -131,8 +155,13 @@ with tab_fax:
         st.subheader("📝 読取結果の確認・修正")
         if st.session_state.current_order:
             order = st.session_state.current_order
-            c_name = st.text_input("顧客名", value=order.get("customer_name", ""), key="fax_cname")
-            d_date = st.text_input("希望納期", value=order.get("delivery_date", ""), key="fax_ddate")
+            c_name = st.text_input("顧客名・会社名", value=order.get("customer_name", ""), key="fax_cname")
+            
+            col_f1, col_f2 = st.columns(2)
+            c_tel = col_f1.text_input("電話番号", value=order.get("customer_tel", ""), key="fax_tel")
+            d_date = col_f2.text_input("希望納期", value=order.get("delivery_date", ""), key="fax_ddate")
+            
+            c_addr = st.text_input("住所・納品先", value=order.get("customer_address", ""), key="fax_addr")
             
             st.write("▼ 注文明細")
             items = order.get("items", [])
@@ -146,8 +175,8 @@ with tab_fax:
             
             notes = st.text_area("備考", value=order.get("notes", ""), key="fax_notes")
             if st.button("✅ この内容で注文を確定・保存", key="btn_save_fax", type="primary"):
-                save_order_items("FAX", c_name, d_date, fax_items_to_save, notes)
-                st.success("FAXからの注文データを「登録済み一覧」に保存しました！")
+                save_order_items("FAX", c_name, c_tel, c_addr, d_date, fax_items_to_save, notes)
+                st.success("FAXからの注文データを保存しました！「登録済み注文一覧」タブを確認してください。")
                 st.session_state.current_order = None
 
 # ==========================================
@@ -155,7 +184,7 @@ with tab_fax:
 # ==========================================
 with tab_mail:
     st.subheader("メール本文のコピペ解析")
-    mail_text = st.text_area("メール本文を貼り付け", height=120, placeholder="〇〇商事です。高圧ホース3mを2本送ってください。")
+    mail_text = st.text_area("メール本文を貼り付け", height=120, placeholder="〇〇商事の田中です。電話番号：03-1234-5678。納品先：東京都千代田区丸の内1-1-1。高圧ホース3mを2本送ってください。")
     
     if st.button("🤖 メールから注文内容を抽出", key="btn_mail_ai"):
         if mail_text:
@@ -166,14 +195,28 @@ with tab_mail:
                     st.json(result)
 
 # ==========================================
-# 3. 電話受付（複数商品・カート方式）
+# 3. 電話受付（顧客選択・電話・住所自動補完 ＋ 複数商品）
 # ==========================================
 with tab_phone:
-    st.subheader("📞 電話受付 - 複数商品スピード登録")
+    st.subheader("📞 電話受付 - 顧客情報と複数商品登録")
     
     col_c1, col_c2 = st.columns(2)
-    customer = col_c1.selectbox("顧客名", CUSTOMER_LIST, key="phone_customer")
+    selected_customer_key = col_c1.selectbox("顧客マスタから選択", list(CUSTOMER_MASTER.keys()), key="phone_customer_select")
     req_date = col_c2.date_input("希望納期", key="phone_date")
+    
+    # 選択した顧客情報を初期値としてセット
+    default_tel = CUSTOMER_MASTER[selected_customer_key]["tel"]
+    default_address = CUSTOMER_MASTER[selected_customer_key]["address"]
+    
+    col_info1, col_info2, col_info3 = st.columns([2, 2, 3])
+    
+    if selected_customer_key == "その他（新規入力）":
+        cust_name_final = col_info1.text_input("顧客名（手入力）", value="", key="phone_cust_custom")
+    else:
+        cust_name_final = col_info1.text_input("顧客名", value=selected_customer_key, key="phone_cust_fixed")
+        
+    cust_tel_final = col_info2.text_input("電話番号", value=default_tel, key="phone_tel_input")
+    cust_addr_final = col_info3.text_input("住所・納品先", value=default_address, key="phone_addr_input")
     
     st.markdown("---")
     st.write("### 🛒 商品の追加")
@@ -222,15 +265,26 @@ with tab_phone:
         phone_notes = st.text_input("通話メモ・特記事項", key="phone_note_input")
         
         if st.button("✅ 複数商品の電話注文を確定・保存", type="primary", use_container_width=True):
-            save_order_items("電話", customer, req_date, st.session_state.phone_cart, phone_notes)
-            st.success(f"【登録完了】{customer} 様の注文（合計 {len(st.session_state.phone_cart)} 品目）を保存しました！「登録済み注文一覧」タブを確認してください。")
-            st.session_state.phone_cart = []
-            st.rerun()
+            if not cust_name_final:
+                st.error("顧客名を入力してください。")
+            else:
+                save_order_items(
+                    "電話", 
+                    cust_name_final, 
+                    cust_tel_final, 
+                    cust_addr_final, 
+                    req_date, 
+                    st.session_state.phone_cart, 
+                    phone_notes
+                )
+                st.success(f"【登録完了】{cust_name_final} 様（TEL: {cust_tel_final}）の注文（合計 {len(st.session_state.phone_cart)} 品目）を保存しました！")
+                st.session_state.phone_cart = []
+                st.rerun()
     else:
         st.info("上の「＋ 明細に追加」ボタンを押して商品を明細に入れてください。")
 
 # ==========================================
-# 4. 登録済み一覧（CSV永続化 ＆ ダウンロード）
+# 4. 登録済み一覧（電話番号・住所を含む最新データ表示）
 # ==========================================
 with tab_list:
     st.subheader("📋 登録済み注文一覧（最新データ）")
@@ -245,7 +299,7 @@ with tab_list:
                 csv_data = df_orders.to_csv(index=False, encoding="utf_8_sig").encode("utf_8_sig")
                 
                 col_d1.download_button(
-                    label="📥 販売管理・基幹連携用CSVをダウンロード",
+                    label="📥 販売管理・配送連携用CSVをダウンロード",
                     data=csv_data,
                     file_name=f"orders_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                     mime="text/csv",
@@ -256,7 +310,7 @@ with tab_list:
                     os.remove(CSV_FILE)
                     st.rerun()
             else:
-                st.info("まだ登録された注文データはありません。電話・FAX・メールから登録を行ってください。")
+                st.info("まだ登録された注文データはありません。")
         except Exception as e:
             st.warning(f"データの読み込み待機中: {e}")
     else:
