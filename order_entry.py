@@ -7,10 +7,10 @@ import re
 import unicodedata
 from datetime import datetime
 import google.generativeai as genai
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageOps
 
 # --------------------------------------------------
-# 初期設定（サイドバーを閉じ、全画面を広く使う設定）
+# 初期設定（サイドバー非表示・全画面レイアウト）
 # --------------------------------------------------
 st.set_page_config(
     page_title="受発注DXタブレットアプリ", 
@@ -37,7 +37,32 @@ def normalize_text(text):
     return unicodedata.normalize('NFKC', str(text)).lower().strip()
 
 # --------------------------------------------------
-# マスタデータの読み込み（文字コード自動判別・検索インデックス付き）
+# 画像前処理（スマホ回転補正・コントラスト強調）
+# --------------------------------------------------
+def preprocess_image_for_ocr(img):
+    """カメラ撮影画像やFAX画像をAIが最も読みやすい状態に自動補正"""
+    try:
+        # 1. スマホ撮影時のEXIF回転情報を検知し、正しい向きに回転
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
+    
+    # RGBAならRGBに変換
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    
+    # 2. コントラストを強調（薄い文字・かすれ文字をくっきりさせる）
+    enhancer_con = ImageEnhance.Contrast(img)
+    img_enhanced = enhancer_con.enhance(1.4)
+    
+    # 3. シャープネスを強調（輪郭のぼやけ・手ブレを低減）
+    enhancer_sha = ImageEnhance.Sharpness(img_enhanced)
+    img_enhanced = enhancer_sha.enhance(1.3)
+    
+    return img_enhanced
+
+# --------------------------------------------------
+# マスタデータの読み込み
 # --------------------------------------------------
 @st.cache_data(ttl=10)
 def load_customer_master():
@@ -244,6 +269,9 @@ def on_customer_selected():
         st.session_state["phone_tel_final"] = ""
         st.session_state["phone_addr_final"] = ""
 
+# --------------------------------------------------
+# 高精度AI解析エンジン（FAXかすれ・手書き・表構造対応）
+# --------------------------------------------------
 def extract_order_info(input_data, is_image=False):
     if not API_KEY:
         st.error("APIキーが設定されていません。Streamlit CloudのSecretsに GEMINI_API_KEY を設定してください。")
@@ -255,12 +283,24 @@ def extract_order_info(input_data, is_image=False):
         st.error(f"APIキー設定エラー: {e}")
         return None
 
+    # FAX特化型の高度な解析プロンプト
     system_prompt = """
-    あなたは受発注伝票の解析アシスタントです。
-    入力された情報（注文書画像またはメール本文）から、以下の情報を抽出し、必ずJSON形式のみで出力してください。
-    余分な解説やMarkdownフォーマットは含めず、純粋なJSONテキストのみを返してください。
+    あなたは日本の商取引・受発注業務における高度な注文書解析エキスパートです。
+    提供された画像（FAX・手書き注文書・写真）またはメールテキストから、注文内容を正確に読み取り、指定のJSON形式のみで出力してください。
 
-    【出力フォーマット】
+    【読み取り時の最重要ルール】
+    1. 【顧客情報】
+       - 「発注元」「貴社名」「御中」「得意先名」「送付元」などの欄から発注者会社名・店舗名を特定してください。
+       - 郵便番号、住所、TEL、FAX番号、顧客コードがあれば正確に抽出してください。
+    2. 【注文明細（商品・数量・単位）】
+       - 表組み（品名、品番、数量、単位、単価）の各行を漏れなく抽出してください。
+       - かすれや手書きの崩し文字がある場合、文脈や標準的な商品名（例: AK-35、BL-10、ホース、ノズル、パッキン等）から推測して補正してください。
+       - 数量が「1」や「2缶」「3本」「5個」などの場合、数量（数値）と単位（缶/本/個/台など）に正しく分離してください。
+    3. 【希望納期・備考】
+       - 「納期」「着日」「配達希望日」「至急」「○月○日着」等の記述があればYYYY-MM-DD（または日付文字列）で抽出してください。
+       - 担当者名、特記事項、備考欄の記述は notes にまとめてください。
+
+    【出力フォーマット（余計な解説・Markdownなしの純粋なJSONテキスト）】
     {
       "customer_code": "顧客コード（不明なら空文字）",
       "customer_name": "顧客名・会社名（不明なら空文字）",
@@ -268,10 +308,10 @@ def extract_order_info(input_data, is_image=False):
       "customer_tel": "電話番号（不明なら空文字）",
       "customer_address": "住所（不明なら空文字）",
       "items": [
-        {"item_name": "商品名や品番", "quantity": 1, "unit": "個/本/缶など"}
+        {"item_name": "品名・品番", "quantity": 1, "unit": "個/本/缶/台など"}
       ],
       "delivery_date": "希望納期（YYYY-MM-DD形式、不明なら空文字）",
-      "notes": "特記事項・署名・役職など"
+      "notes": "特記事項・担当者名・メモなど"
     }
     """
     
@@ -286,12 +326,17 @@ def extract_order_info(input_data, is_image=False):
     if not valid_models:
         valid_models = ["models/gemini-1.5-flash", "models/gemini-2.0-flash", "models/gemini-1.5-pro"]
 
+    # 画像の場合は自動補正（回転・コントラスト）を適用
+    processed_input = input_data
+    if is_image and isinstance(input_data, Image.Image):
+        processed_input = preprocess_image_for_ocr(input_data)
+
     last_error = None
     for model_name in valid_models:
         try:
             m = genai.GenerativeModel(model_name)
             if is_image:
-                response = m.generate_content([system_prompt, input_data])
+                response = m.generate_content([system_prompt, processed_input])
             else:
                 response = m.generate_content(f"{system_prompt}\n\n【対象テキスト】\n{input_data}")
             
@@ -322,7 +367,7 @@ tab_fax, tab_mail, tab_phone, tab_list = st.tabs([
 ])
 
 # ==========================================
-# 1. FAX（写真・スキャン）
+# 1. FAX（写真・スキャン自動補正読み取り）
 # ==========================================
 with tab_fax:
     st.subheader("FAX注文書の写真・スキャン取り込み")
@@ -331,9 +376,10 @@ with tab_fax:
         uploaded_file = st.file_uploader("注文書画像を選択（またはカメラ撮影）", type=["jpg", "jpeg", "png", "pdf"], key="fax_upload")
         if uploaded_file:
             img = Image.open(uploaded_file)
-            st.image(img, caption="アップロードされた注文書", use_container_width=True)
-            if st.button("🤖 AIで自動読取を実行", key="btn_fax_ai"):
-                with st.spinner("Geminiが解析中..."):
+            # プレビュー表示
+            st.image(img, caption="アップロード画像（自動補正を適用して解析します）", use_container_width=True)
+            if st.button("🤖 AIで高精度読取を実行", key="btn_fax_ai", type="primary"):
+                with st.spinner("画像の向き補正・コントラスト強調・Gemini高精度解析中..."):
                     result = extract_order_info(img, is_image=True)
                     if result:
                         st.session_state.current_order_fax = result
