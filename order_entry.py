@@ -9,7 +9,7 @@ import google.generativeai as genai
 from PIL import Image
 
 # --------------------------------------------------
-# 初期設定 & API設定
+# 初期設定 & サイドバーでのAPIキー設定
 # --------------------------------------------------
 st.set_page_config(page_title="受発注DXタブレットアプリ", layout="wide")
 
@@ -22,18 +22,27 @@ COLUMNS = [
     "住所", "電話番号", "品番", "品名", "数量", "単価", "小計", "希望納期", "備考"
 ]
 
-# ご指定のAPIキーを設定
-GEMINI_API_KEY = "AIzaSyBkraxElwA3Fnx5muYa9X_vwaqMA-97uks"
+# サイドバーでAPIキーの入力・確認が可能
+with st.sidebar:
+    st.header("⚙️ 設定")
+    secret_key = st.secrets.get("GEMINI_API_KEY", "")
+    api_key_input = st.text_input(
+        "Gemini API Key（AIzaSy...）", 
+        value=secret_key, 
+        type="password",
+        help="Google AI Studioで取得した 'AIzaSy' から始まるキーを入力してください"
+    )
 
 model = None
-try:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-1.5-flash")
-except Exception as e:
-    st.error(f"Gemini初期化エラー: {e}")
+if api_key_input:
+    try:
+        genai.configure(api_key=api_key_input.strip())
+        model = genai.GenerativeModel("gemini-1.5-flash")
+    except Exception as e:
+        st.sidebar.error(f"キー初期化エラー: {e}")
 
 # --------------------------------------------------
-# マスタデータの読み込み（自動初期化・ゆらぎ吸収）
+# マスタデータの読み込み
 # --------------------------------------------------
 @st.cache_data(ttl=60)
 def load_customer_master():
@@ -152,9 +161,7 @@ def save_order_items(channel, code, customer, zip_code, tel, address, delivery_d
     df_combined = pd.concat([df_existing, df_new], ignore_index=True)
     df_combined.to_csv(ORDERS_CSV, index=False, encoding="utf-8-sig")
 
-# --------------------------------------------------
 # セッション状態初期化
-# --------------------------------------------------
 if "current_order_fax" not in st.session_state:
     st.session_state.current_order_fax = None
 if "current_order_mail" not in st.session_state:
@@ -165,7 +172,7 @@ if "phone_cart" not in st.session_state:
 def extract_order_info(input_data, is_image=False):
     """Gemini AI解析処理"""
     if model is None:
-        st.error("APIキーが無効または初期化に失敗しています。Google AI Studioでキーを確認してください。")
+        st.error("左側サイドバーに有効なGemini APIキー（AIzaSy...）を入力してください。")
         return None
         
     system_prompt = """
@@ -194,7 +201,6 @@ def extract_order_info(input_data, is_image=False):
             response = model.generate_content(f"{system_prompt}\n\n【対象テキスト】\n{input_data}")
         
         raw_text = response.text.strip()
-        # マークダウン記法の除去
         clean_text = re.sub(r"```json\s*", "", raw_text)
         clean_text = re.sub(r"```\s*", "", clean_text).strip()
         
@@ -278,7 +284,7 @@ with tab_mail:
         mail_text = st.text_area(
             "メール本文を貼り付け", 
             height=200, 
-            placeholder="お世話様です。\nAK-35 2缶 注文をお願いします。\n\n株式会社 ケーアイ CSO"
+            placeholder="お世話様です。\nAK-35 2缶 注文をお願いします。\n\n株式会社 ケーアイ CSO\n藤田 信昭\n〒910-0367 福井県坂井市丸岡町羽崎12-16-19\nTEL: 0776-67-1777"
         )
         if st.button("🤖 メールから注文内容を抽出", key="btn_mail_ai"):
             if mail_text:
@@ -321,7 +327,7 @@ with tab_mail:
                 st.rerun()
 
 # ==========================================
-# 3. 電話（顧客コード・郵便番号・住所 部分一致検索）
+# 3. 電話（顧客・商品 部分一致検索）
 # ==========================================
 with tab_phone:
     st.subheader("📞 電話受付 - 顧客・商品検索と明細登録")
