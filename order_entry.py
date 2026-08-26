@@ -16,27 +16,33 @@ ORDERS_CSV = "orders_data.csv"
 ITEMS_CSV = "items.csv"
 CUSTOMERS_CSV = "customers.csv"
 
-# 注文一覧の列定義（顧客コード・郵便番号を追加）
 COLUMNS = [
     "注文日時", "受付種別", "顧客コード", "顧客名", "郵便番号", 
     "住所", "電話番号", "品番", "品名", "数量", "単価", "小計", "希望納期", "備考"
 ]
 
+# APIキー設定とモデル初期化（安全なフォールバック対応）
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
+model = None
+if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_GEMINI_API_KEY":
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel("gemini-1.5-flash")
+    except Exception as e:
+        st.error(f"Gemini初期化エラー: {e}")
+
 # --------------------------------------------------
-# マスタデータの読み込み（基幹システムCSV対応）
+# マスタデータの読み込み
 # --------------------------------------------------
 @st.cache_data(ttl=60)
 def load_customer_master():
-    """顧客マスタCSVの読み込み（住所結合・コード保持対応）"""
     if not os.path.exists(CUSTOMERS_CSV):
-        sample_cust = pd.DataFrame([
+        return pd.DataFrame([
             {"顧客コード": "1", "顧客名": "株式会社サンプル商事 本社", "郵便番号": "100-0005", "住所": "東京都千代田区丸の内1-1-1", "電話番号": "03-1234-5678"},
             {"顧客コード": "2", "顧客名": "株式会社サンプル商事 大阪支店", "郵便番号": "530-0001", "住所": "大阪府大阪市北区梅田2-2-2", "電話番号": "06-9876-5432"},
         ])
-        return sample_cust
 
     try:
-        # SMILE等の基幹システム出力形式（先頭行ヘッダー対応）を判定して読み込み
         df_raw = pd.read_csv(CUSTOMERS_CSV, header=None, dtype=str)
         header_row_idx = 0
         for idx, row in df_raw.head(5).iterrows():
@@ -46,13 +52,10 @@ def load_customer_master():
                 break
         
         df = pd.read_csv(CUSTOMERS_CSV, skiprows=header_row_idx, dtype=str)
-        
-        # 列名のゆらぎ吸収（得意先ｺｰﾄﾞ / 得意先名称１ / 住所１・２・３ など）
         code_col = next((c for c in df.columns if "ｺｰﾄﾞ" in str(c) or "コード" in str(c)), df.columns[0])
         name_col = next((c for c in df.columns if "名称" in str(c) or "名" in str(c)), df.columns[1])
         zip_col = next((c for c in df.columns if "郵便" in str(c)), None)
         tel_col = next((c for c in df.columns if "電話" in str(c) or "TEL" in str(c)), None)
-        
         addr_cols = [c for c in df.columns if "住所" in str(c)]
         
         result_df = pd.DataFrame()
@@ -61,13 +64,11 @@ def load_customer_master():
         result_df["郵便番号"] = df[zip_col].fillna("").astype(str).str.strip() if zip_col else ""
         result_df["電話番号"] = df[tel_col].fillna("").astype(str).str.strip() if tel_col else ""
         
-        # 住所1, 住所2, 住所3 を1つに結合
         if addr_cols:
             result_df["住所"] = df[addr_cols].fillna("").apply(lambda r: " ".join([x.strip() for x in r if x.strip()]), axis=1)
         else:
             result_df["住所"] = ""
             
-        # 空行やヘッダー行を除去
         result_df = result_df[result_df["顧客名"] != ""]
         result_df = result_df[~result_df["顧客名"].str.contains("名称|得意先", na=False)]
         return result_df
@@ -77,23 +78,17 @@ def load_customer_master():
 
 @st.cache_data(ttl=60)
 def load_item_master():
-    """商品マスタCSVの読み込み"""
     if not os.path.exists(ITEMS_CSV):
-        sample_items = pd.DataFrame([
+        return pd.DataFrame([
             {"品番": "A-101", "品名": "超音波ノズル先端部品", "標準単価": 12000},
             {"品番": "A-102", "品名": "高圧ホース 3m", "標準単価": 8500},
-            {"品番": "B-201", "品名": "専用洗浄溶剤 5L", "標準単価": 4500},
-            {"品番": "B-202", "品名": "皮革用リカラー染料（ブラック）", "標準単価": 3200},
-            {"品番": "C-301", "品名": "交換用パッキンセット", "標準単価": 1500},
+            {"品番": "AK-35", "品名": "専用洗浄液 AK-35", "標準単価": 5500},
         ])
-        sample_items.to_csv(ITEMS_CSV, index=False, encoding="utf-8-sig")
-        return sample_items
     try:
         return pd.read_csv(ITEMS_CSV, encoding="utf-8-sig", dtype={"品番": str})
     except Exception:
         return pd.DataFrame(columns=["品番", "品名", "標準単価"])
 
-# 注文履歴の安全読み込み
 def load_orders_safe():
     if not os.path.exists(ORDERS_CSV):
         return pd.DataFrame(columns=COLUMNS)
@@ -108,14 +103,12 @@ def load_orders_safe():
         df.to_csv(ORDERS_CSV, index=False, encoding="utf-8-sig")
         return df
 
-# Excel生成
 def to_excel_bytes(df):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='受注データ一覧')
     return output.getvalue()
 
-# 注文保存
 def save_order_items(channel, code, customer, zip_code, tel, address, delivery_date, items, notes):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     new_rows = []
@@ -144,18 +137,18 @@ def save_order_items(channel, code, customer, zip_code, tel, address, delivery_d
     df_combined = pd.concat([df_existing, df_new], ignore_index=True)
     df_combined.to_csv(ORDERS_CSV, index=False, encoding="utf-8-sig")
 
-# API設定
-GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
-if GEMINI_API_KEY != "YOUR_GEMINI_API_KEY":
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-1.5-flash")
-
-if "current_order" not in st.session_state:
-    st.session_state.current_order = None
+# セッション状態初期化
+if "current_order_fax" not in st.session_state:
+    st.session_state.current_order_fax = None
+if "current_order_mail" not in st.session_state:
+    st.session_state.current_order_mail = None
 if "phone_cart" not in st.session_state:
     st.session_state.phone_cart = []
 
 def extract_order_info(input_data, is_image=False):
+    if model is None:
+        st.error("APIキーが設定されていないか無効です。Streamlit Secretsを確認してください。")
+        return None
     system_prompt = """
     あなたは受発注伝票の解析アシスタントです。
     入力された情報（注文書画像またはメール本文）から、以下の情報を抽出し、必ずJSON形式のみで出力してください。
@@ -166,7 +159,7 @@ def extract_order_info(input_data, is_image=False):
       "customer_zip": "郵便番号（不明なら空文字）",
       "customer_tel": "電話番号（不明なら空文字）",
       "customer_address": "住所（不明なら空文字）",
-      "items": [{"item_name": "商品名や品番", "quantity": 数値, "unit": "個/本など"}],
+      "items": [{"item_name": "商品名や品番", "quantity": 数値, "unit": "個/本/缶など"}],
       "delivery_date": "希望納期（YYYY-MM-DD形式、不明なら空文字）",
       "notes": "特記事項・備考"
     }
@@ -212,13 +205,13 @@ with tab_fax:
                 with st.spinner("Geminiが解析中..."):
                     result = extract_order_info(img, is_image=True)
                     if result:
-                        st.session_state.current_order = result
+                        st.session_state.current_order_fax = result
                         st.success("解析完了！右側で内容を確認してください。")
 
     with col2:
         st.subheader("📝 読取結果の確認・修正")
-        if st.session_state.current_order:
-            order = st.session_state.current_order
+        if st.session_state.current_order_fax:
+            order = st.session_state.current_order_fax
             col_fc1, col_fc2 = st.columns([1, 2])
             c_code = col_fc1.text_input("顧客コード", value=order.get("customer_code", ""), key="fax_ccode")
             c_name = col_fc2.text_input("顧客名・会社名", value=order.get("customer_name", ""), key="fax_cname")
@@ -244,21 +237,60 @@ with tab_fax:
             if st.button("✅ この内容で注文を確定・保存", key="btn_save_fax", type="primary"):
                 save_order_items("FAX", c_code, c_name, c_zip, c_tel, c_addr, d_date, fax_items_to_save, notes)
                 st.success("FAX注文を保存しました！一覧タブを確認してください。")
-                st.session_state.current_order = None
+                st.session_state.current_order_fax = None
 
 # ==========================================
-# 2. メール
+# 2. メール（解析 ＋ 確認・確定保存）
 # ==========================================
 with tab_mail:
-    st.subheader("メール本文のコピペ解析")
-    mail_text = st.text_area("メール本文を貼り付け", height=120, placeholder="〇〇商事です。高圧ホース3mを2本送ってください。")
-    if st.button("🤖 メールから注文内容を抽出", key="btn_mail_ai"):
-        if mail_text:
-            with st.spinner("AI解析中..."):
-                result = extract_order_info(mail_text, is_image=False)
-                if result:
-                    st.session_state.current_order = result
-                    st.json(result)
+    st.subheader("メール本文のコピペ解析 ＆ 登録")
+    col_m1, col_m2 = st.columns([1, 1])
+    
+    with col_m1:
+        mail_text = st.text_area(
+            "メール本文を貼り付け", 
+            height=200, 
+            placeholder="お世話様です。\nAK-35 2缶 注文をお願いします。\n\n株式会社 ケーアイ CSO"
+        )
+        if st.button("🤖 メールから注文内容を抽出", key="btn_mail_ai"):
+            if mail_text:
+                with st.spinner("AI解析中..."):
+                    result = extract_order_info(mail_text, is_image=False)
+                    if result:
+                        st.session_state.current_order_mail = result
+                        st.success("抽出完了！右側で内容を確認・修正してください。")
+
+    with col_m2:
+        st.subheader("📝 抽出結果の確認・修正")
+        if st.session_state.current_order_mail:
+            m_order = st.session_state.current_order_mail
+            col_mc1, col_mc2 = st.columns([1, 2])
+            m_code = col_mc1.text_input("顧客コード", value=m_order.get("customer_code", ""), key="mail_ccode")
+            m_name = col_mc2.text_input("顧客名・会社名", value=m_order.get("customer_name", ""), key="mail_cname")
+            
+            col_mf1, col_mf2, col_mf3 = st.columns([1, 1, 1])
+            m_zip = col_mf1.text_input("郵便番号", value=m_order.get("customer_zip", ""), key="mail_zip")
+            m_tel = col_mf2.text_input("電話番号", value=m_order.get("customer_tel", ""), key="mail_tel")
+            m_ddate = col_mf3.text_input("希望納期", value=m_order.get("delivery_date", ""), key="mail_ddate")
+            
+            m_addr = st.text_input("住所・納品先", value=m_order.get("customer_address", ""), key="mail_addr")
+            
+            st.write("▼ 注文明細")
+            m_items = m_order.get("items", [])
+            mail_items_to_save = []
+            for i, itm in enumerate(m_items):
+                c_i1, c_i2, c_i3 = st.columns([3, 1, 1])
+                name = c_i1.text_input(f"品名/品番 #{i+1}", value=itm.get("item_name", ""), key=f"mail_item_{i}")
+                qty = c_i2.number_input(f"数量 #{i+1}", value=int(itm.get("quantity", 1)), min_value=1, key=f"mail_qty_{i}")
+                unit = c_i3.text_input(f"単位 #{i+1}", value=itm.get("unit", "個"), key=f"mail_unit_{i}")
+                mail_items_to_save.append({"name": name, "qty": qty, "price": 0})
+            
+            m_notes = st.text_area("備考", value=m_order.get("notes", ""), key="mail_notes")
+            if st.button("✅ この内容でメール注文を確定・保存", key="btn_save_mail", type="primary"):
+                save_order_items("メール", m_code, m_name, m_zip, m_tel, m_addr, m_ddate, mail_items_to_save, m_notes)
+                st.success("メール注文を保存しました！「登録済み注文一覧」タブを確認してください。")
+                st.session_state.current_order_mail = None
+                st.rerun()
 
 # ==========================================
 # 3. 電話（顧客コード・郵便番号・住所 部分一致検索）
@@ -271,7 +303,6 @@ with tab_phone:
     cust_query = col_cs1.text_input("🔍 顧客検索（コード・社名・郵便番号・電話・住所の一部を入力）", placeholder="例: 井助、アタゴ、910、0776、坂井市 など", key="cust_search_query")
     req_date = col_cs2.date_input("希望納期", key="phone_date")
 
-    # 4,900件超の顧客から部分一致検索
     if cust_query:
         matched_cust = df_cust_master[
             df_cust_master["顧客コード"].str.contains(cust_query, case=False, na=False) |
@@ -281,7 +312,7 @@ with tab_phone:
             df_cust_master["住所"].str.contains(cust_query, case=False, na=False)
         ]
     else:
-        matched_cust = df_cust_master.head(50)  # 初期表示は上位50件
+        matched_cust = df_cust_master.head(50)
 
     cust_options = ["新規または手入力"] + [
         f"【{row['顧客コード']}】 {row['顧客名']} ｜ 〒{row['郵便番号']} ｜ {row['住所']} ｜ TEL: {row['電話番号']}"
@@ -294,7 +325,6 @@ with tab_phone:
         key="selected_cust_dropdown"
     )
 
-    # 選択内容を各欄に自動反映
     if selected_cust_str != "新規または手入力":
         sel_code = selected_cust_str.split("】")[0].replace("【", "").strip()
         row_match = df_cust_master[df_cust_master["顧客コード"] == sel_code].iloc[0]
@@ -323,7 +353,7 @@ with tab_phone:
     st.markdown("#### 2. 商品の検索・カート追加")
     
     col_is1, col_is2 = st.columns([2, 3])
-    item_query = col_is1.text_input("🔍 商品検索（品番・品名の一部を入力）", placeholder="例: ホース、ノズル、A-10 など", key="item_search_query")
+    item_query = col_is1.text_input("🔍 商品検索（品番・品名の一部を入力）", placeholder="例: ホース、ノズル、AK など", key="item_search_query")
     
     if item_query:
         matched_items = df_items_master[
