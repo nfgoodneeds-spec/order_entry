@@ -96,7 +96,7 @@ def load_customer_master():
 
 @st.cache_data(ttl=10)
 def load_item_master():
-    """商品マスタCSVの読み込み（基幹10,000件対応・単価/単位自動取得）"""
+    """商品マスタCSVの読み込み"""
     if not os.path.exists(ITEMS_CSV):
         return pd.DataFrame([
             {"品番": "500102", "品名": "溶剤 AK-35", "品名索引": "AK-35", "単位": "缶", "標準単価": 17500},
@@ -127,7 +127,6 @@ def load_item_master():
         res_df["品名索引"] = df[index_col].fillna("").astype(str).str.strip() if index_col else ""
         res_df["単位"] = df[unit_col].fillna("個").astype(str).str.strip() if unit_col else "個"
         
-        # 単価の数値整形
         if price_col:
             res_df["標準単価"] = pd.to_numeric(df[price_col].astype(str).str.replace(",", ""), errors='coerce').fillna(0).astype(int)
         else:
@@ -204,10 +203,19 @@ if "current_order_mail" not in st.session_state:
 if "phone_cart" not in st.session_state:
     st.session_state.phone_cart = []
 
+# 入力欄のセッション保持
 for k in ["phone_cust_code_final", "phone_cust_name_final", "phone_zip_final", "phone_tel_final", "phone_addr_final"]:
     if k not in st.session_state:
         st.session_state[k] = ""
 
+if "add_qty" not in st.session_state:
+    st.session_state["add_qty"] = 1
+if "add_unit" not in st.session_state:
+    st.session_state["add_unit"] = "個"
+if "add_price" not in st.session_state:
+    st.session_state["add_price"] = 0
+
+# 顧客選択時のコールバック
 def on_customer_selected():
     sel_val = st.session_state.get("selected_cust_dropdown", "")
     df_cust = load_customer_master()
@@ -227,6 +235,18 @@ def on_customer_selected():
         st.session_state["phone_zip_final"] = ""
         st.session_state["phone_tel_final"] = ""
         st.session_state["phone_addr_final"] = ""
+
+# 商品選択時のコールバック（単位・単価を即時更新）
+def on_item_selected():
+    sel_val = st.session_state.get("selected_item_dropdown", "")
+    df_items = load_item_master()
+    if sel_val:
+        sel_code = sel_val.split("】")[0].replace("【", "").strip()
+        matched = df_items[df_items["品番"].astype(str) == sel_code]
+        if not matched.empty:
+            row = matched.iloc[0]
+            st.session_state["add_unit"] = str(row["単位"])
+            st.session_state["add_price"] = int(row["標準単価"])
 
 def extract_order_info(input_data, is_image=False):
     if not api_key_input:
@@ -467,18 +487,31 @@ with tab_phone:
         for _, row in matched_items.iterrows()
     ]
 
+    # 初回初期値の安全セット
+    if "selected_item_dropdown" not in st.session_state and item_options:
+        first_opt = item_options[0]
+        first_code = first_opt.split("】")[0].replace("【", "").strip()
+        first_matched = df_items_master[df_items_master["品番"].astype(str) == first_code]
+        if not first_matched.empty:
+            st.session_state["add_unit"] = str(first_matched.iloc[0]["単位"])
+            st.session_state["add_price"] = int(first_matched.iloc[0]["標準単価"])
+
     if item_options:
-        selected_item_str = col_is2.selectbox(f"商品候補（該当 {len(matched_items)} 件）", item_options, key="selected_item_dropdown")
+        selected_item_str = col_is2.selectbox(
+            f"商品候補（該当 {len(matched_items)} 件）", 
+            item_options, 
+            key="selected_item_dropdown",
+            on_change=on_item_selected
+        )
+        
         selected_code = selected_item_str.split("】")[0].replace("【", "").strip()
         item_row = df_items_master[df_items_master["品番"].astype(str) == selected_code].iloc[0]
-        default_price = int(item_row["標準単価"])
         selected_name = str(item_row["品名"])
-        selected_unit = str(item_row["単位"])
 
         col_p1, col_p2, col_p3, col_p4 = st.columns([1, 1, 1, 1])
-        qty = col_p1.number_input("数量", min_value=1, value=1, key="add_qty")
-        item_unit_input = col_p2.text_input("単位", value=selected_unit, key="add_unit")
-        unit_price = col_p3.number_input("単価（円）", value=default_price, step=100, key="add_price")
+        qty = col_p1.number_input("数量", min_value=1, key="add_qty")
+        item_unit_input = col_p2.text_input("単位", key="add_unit")
+        unit_price = col_p3.number_input("単価（円）", step=100, key="add_price")
         
         with col_p4:
             st.write("")
