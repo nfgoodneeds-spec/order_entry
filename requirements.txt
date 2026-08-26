@@ -1,0 +1,12 @@
+> streamlit
+    > google-generativeai
+    > pillow
+    > pandas
+    > ```
+  </Step>
+
+  <Step title="変更を保存（コミット）">
+    ファイルが枠内に追加されたら、画面下部にある緑色のボタン **「Commit changes」**（変更をコミット）をクリックします。
+  </Step>
+
+</Sequence>
