@@ -33,18 +33,17 @@ with st.sidebar:
     )
 
 # --------------------------------------------------
-# マスタデータの読み込み（Shift-JIS / UTF-8 自動判別）
+# マスタデータの読み込み（ヘッダー行完全対応）
 # --------------------------------------------------
 @st.cache_data(ttl=10)
 def load_customer_master():
-    """顧客マスタCSVの読み込み（文字コード自動判別・基幹ヘッダ対応）"""
+    """顧客マスタCSVの読み込み（基幹システムヘッダー補正・文字コード自動判別）"""
     if not os.path.exists(CUSTOMERS_CSV):
         return pd.DataFrame([
             {"顧客コード": "1", "顧客名": "株式会社サンプル商事 本社", "郵便番号": "100-0005", "住所": "東京都千代田区丸の内1-1-1", "電話番号": "03-1234-5678"},
             {"顧客コード": "2", "顧客名": "株式会社サンプル商事 大阪支店", "郵便番号": "530-0001", "住所": "大阪府大阪市北区梅田2-2-2", "電話番号": "06-9876-5432"},
         ])
 
-    # エンコーディングの自動判別トライアル
     df_raw = None
     for enc in ["cp932", "shift_jis", "utf-8-sig", "utf-8"]:
         try:
@@ -57,25 +56,24 @@ def load_customer_master():
         return pd.DataFrame(columns=["顧客コード", "顧客名", "郵便番号", "住所", "電話番号"])
 
     try:
-        # ヘッダー行の自動探索
+        # 正しいヘッダー行（得意先ｺｰﾄﾞ や 得意先名称 が含まれる行）を厳密に特定
         header_row_idx = 0
-        for idx, row in df_raw.head(5).iterrows():
+        for idx, row in df_raw.head(10).iterrows():
             row_str = " ".join(row.dropna().astype(str))
-            if "得意先" in row_str or "顧客" in row_str or "名称" in row_str:
+            if "得意先ｺｰﾄﾞ" in row_str or "得意先コード" in row_str or "得意先名称" in row_str or "電話番号" in row_str:
                 header_row_idx = idx
                 break
         
-        # ヘッダー行を適用して整形
-        header_cols = df_raw.iloc[header_row_idx].fillna("").astype(str).tolist()
+        header_cols = [str(x).strip() for x in df_raw.iloc[header_row_idx].fillna("").tolist()]
         df = df_raw.iloc[header_row_idx + 1:].copy()
         df.columns = header_cols
 
-        # 各列の探索
-        code_col = next((c for c in df.columns if "ｺｰﾄﾞ" in str(c) or "コード" in str(c)), df.columns[0])
-        name_col = next((c for c in df.columns if "名称" in str(c) or "名" in str(c)), df.columns[1])
-        zip_col = next((c for c in df.columns if "郵便" in str(c)), None)
-        tel_col = next((c for c in df.columns if "電話" in str(c) or "TEL" in str(c)), None)
-        addr_cols = [c for c in df.columns if "住所" in str(c)]
+        # 各列を正確に抽出
+        code_col = next((c for c in df.columns if "ｺｰﾄﾞ" in c or "コード" in c), df.columns[0])
+        name_col = next((c for c in df.columns if "名称" in c or "名" in c), df.columns[1])
+        zip_col = next((c for c in df.columns if "郵便" in c), None)
+        tel_col = next((c for c in df.columns if "電話" in c or "TEL" in c), None)
+        addr_cols = [c for c in df.columns if "住所" in c]
         
         result_df = pd.DataFrame()
         result_df["顧客コード"] = df[code_col].fillna("").astype(str).str.strip()
@@ -84,10 +82,14 @@ def load_customer_master():
         result_df["電話番号"] = df[tel_col].fillna("").astype(str).str.strip() if tel_col else ""
         
         if addr_cols:
-            result_df["住所"] = df[addr_cols].fillna("").apply(lambda r: " ".join([str(x).strip() for x in r if str(x).strip() and str(x) != "nan"]), axis=1)
+            result_df["住所"] = df[addr_cols].fillna("").apply(
+                lambda r: " ".join([str(x).strip() for x in r if str(x).strip() and str(x) != "nan"]), 
+                axis=1
+            )
         else:
             result_df["住所"] = ""
             
+        # 不要なヘッダー再混入や空行を除外
         result_df = result_df[result_df["顧客名"] != ""]
         result_df = result_df[~result_df["顧客名"].str.contains("名称|得意先", na=False)]
         return result_df.reset_index(drop=True)
@@ -385,18 +387,18 @@ with tab_phone:
 
     if selected_cust_str != "新規または手入力":
         sel_code = selected_cust_str.split("】")[0].replace("【", "").strip()
-        row_match = df_cust_master[df_cust_master["顧客コード"] == sel_code].iloc[0]
-        init_code = str(row_match["顧客コード"])
-        init_name = str(row_match["顧客名"])
-        init_zip = str(row_match["郵便番号"])
-        init_tel = str(row_match["電話番号"])
-        init_addr = str(row_match["住所"])
+        matched_rows = df_cust_master[df_cust_master["顧客コード"] == sel_code]
+        if not matched_rows.empty:
+            row_match = matched_rows.iloc[0]
+            init_code = str(row_match["顧客コード"])
+            init_name = str(row_match["顧客名"])
+            init_zip = str(row_match["郵便番号"])
+            init_tel = str(row_match["電話番号"])
+            init_addr = str(row_match["住所"])
+        else:
+            init_code = init_name = init_zip = init_tel = init_addr = ""
     else:
-        init_code = ""
-        init_name = ""
-        init_zip = ""
-        init_tel = ""
-        init_addr = ""
+        init_code = init_name = init_zip = init_tel = init_addr = ""
 
     col_info1, col_info2 = st.columns([1, 3])
     cust_code_final = col_info1.text_input("顧客コード", value=init_code, key="phone_cust_code_final")
