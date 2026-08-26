@@ -15,7 +15,50 @@ st.set_page_config(page_title="受発注DXタブレットアプリ", layout="wid
 CSV_FILE = "orders_data.csv"
 COLUMNS = ["注文日時", "受付種別", "顧客名", "電話番号", "住所", "品番", "品名", "数量", "単価", "小計", "希望納期", "備考"]
 
-# CSVを安全に読み込む関数
+# 商品マスタ
+ITEM_MASTER = {
+    "A-101": {"name": "超音波ノズル先端部品", "price": 12000},
+    "A-102": {"name": "高圧ホース 3m", "price": 8500},
+    "B-201": {"name": "専用洗浄溶剤 5L", "price": 4500},
+    "B-202": {"name": "皮革用リカラー染料（ブラック）", "price": 3200},
+    "C-301": {"name": "交換用パッキンセット", "price": 1500},
+}
+
+# 顧客マスタ
+CUSTOMER_MASTER = {
+    "株式会社サンプル商事 本社": {"tel": "03-1234-5678", "address": "東京都千代田区丸の内1-1-1"},
+    "株式会社サンプル商事 大阪支店": {"tel": "06-9876-5432", "address": "大阪府大阪市北区梅田2-2-2"},
+    "東京リユース工業": {"tel": "03-3333-4444", "address": "東京都大田区羽田旭町3-3"},
+    "埼玉メンテナンス": {"tel": "048-555-6666", "address": "埼玉県さいたま市大宮区桜木町4-4"},
+    "その他（新規入力）": {"tel": "", "address": ""}
+}
+
+# 顧客マスタ連動用コールバック関数
+def sync_customer_fields():
+    selected = st.session_state.get("phone_customer_select")
+    if selected and selected in CUSTOMER_MASTER:
+        if selected == "その他（新規入力）":
+            st.session_state["phone_cust_name"] = ""
+            st.session_state["phone_tel_input"] = ""
+            st.session_state["phone_addr_input"] = ""
+        else:
+            st.session_state["phone_cust_name"] = selected
+            st.session_state["phone_tel_input"] = CUSTOMER_MASTER[selected]["tel"]
+            st.session_state["phone_addr_input"] = CUSTOMER_MASTER[selected]["address"]
+
+# セッション状態の初期化
+if "current_order" not in st.session_state:
+    st.session_state.current_order = None
+if "phone_cart" not in st.session_state:
+    st.session_state.phone_cart = []
+
+if "phone_cust_name" not in st.session_state:
+    default_first_cust = list(CUSTOMER_MASTER.keys())[0]
+    st.session_state["phone_cust_name"] = default_first_cust
+    st.session_state["phone_tel_input"] = CUSTOMER_MASTER[default_first_cust]["tel"]
+    st.session_state["phone_addr_input"] = CUSTOMER_MASTER[default_first_cust]["address"]
+
+# CSV安全読み込み関数
 def load_orders_safe():
     if not os.path.exists(CSV_FILE):
         return pd.DataFrame(columns=COLUMNS)
@@ -30,14 +73,14 @@ def load_orders_safe():
         df.to_csv(CSV_FILE, index=False, encoding="utf-8-sig")
         return df
 
-# Excel（.xlsx）生成関数
+# Excel生成関数
 def to_excel_bytes(df):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='受注データ一覧')
     return output.getvalue()
 
-# 注文保存用の共通関数
+# 注文保存用関数
 def save_order_items(channel, customer, tel, address, delivery_date, items, notes):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     new_rows = []
@@ -70,29 +113,7 @@ if GEMINI_API_KEY != "YOUR_GEMINI_API_KEY":
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel("gemini-1.5-flash")
 
-# 商品マスタ
-ITEM_MASTER = {
-    "A-101": {"name": "超音波ノズル先端部品", "price": 12000},
-    "A-102": {"name": "高圧ホース 3m", "price": 8500},
-    "B-201": {"name": "専用洗浄溶剤 5L", "price": 4500},
-    "B-202": {"name": "皮革用リカラー染料（ブラック）", "price": 3200},
-    "C-301": {"name": "交換用パッキンセット", "price": 1500},
-}
-
-# 顧客マスタ
-CUSTOMER_MASTER = {
-    "株式会社サンプル商事 本社": {"tel": "03-1234-5678", "address": "東京都千代田区丸の内1-1-1"},
-    "株式会社サンプル商事 大阪支店": {"tel": "06-9876-5432", "address": "大阪府大阪市北区梅田2-2-2"},
-    "東京リユース工業": {"tel": "03-3333-4444", "address": "東京都大田区羽田旭町3-3"},
-    "埼玉メンテナンス": {"tel": "048-555-6666", "address": "埼玉県さいたま市大宮区桜木町4-4"},
-    "その他（新規入力）": {"tel": "", "address": ""}
-}
-
-if "current_order" not in st.session_state:
-    st.session_state.current_order = None
-if "phone_cart" not in st.session_state:
-    st.session_state.phone_cart = []
-
+# AI抽出関数
 def extract_order_info(input_data, is_image=False):
     system_prompt = """
     あなたは受発注伝票の解析アシスタントです。
@@ -184,20 +205,22 @@ with tab_mail:
                     st.session_state.current_order = result
                     st.json(result)
 
-# 3. 電話
+# 3. 電話（顧客マスタ選択で即座に連動）
 with tab_phone:
     st.subheader("📞 電話受付 - 顧客情報と複数商品登録")
     col_c1, col_c2 = st.columns(2)
-    selected_customer_key = col_c1.selectbox("顧客マスタから選択", list(CUSTOMER_MASTER.keys()), key="phone_customer_select")
+    col_c1.selectbox(
+        "顧客マスタから選択", 
+        list(CUSTOMER_MASTER.keys()), 
+        key="phone_customer_select",
+        on_change=sync_customer_fields
+    )
     req_date = col_c2.date_input("希望納期", key="phone_date")
     
-    default_tel = CUSTOMER_MASTER[selected_customer_key]["tel"]
-    default_address = CUSTOMER_MASTER[selected_customer_key]["address"]
-    
     col_info1, col_info2, col_info3 = st.columns([2, 2, 3])
-    cust_name_final = col_info1.text_input("顧客名", value="" if selected_customer_key == "その他（新規入力）" else selected_customer_key, key="phone_cust_name")
-    cust_tel_final = col_info2.text_input("電話番号", value=default_tel, key="phone_tel_input")
-    cust_addr_final = col_info3.text_input("住所・納品先", value=default_address, key="phone_addr_input")
+    cust_name_final = col_info1.text_input("顧客名", key="phone_cust_name")
+    cust_tel_final = col_info2.text_input("電話番号", key="phone_tel_input")
+    cust_addr_final = col_info3.text_input("住所・納品先", key="phone_addr_input")
     
     st.markdown("---")
     st.write("### 🛒 商品の追加")
@@ -242,7 +265,7 @@ with tab_phone:
                 st.session_state.phone_cart = []
                 st.rerun()
 
-# 4. 登録済み一覧（Excel & CSV 出力対応）
+# 4. 登録済み一覧
 with tab_list:
     st.subheader("📋 登録済み注文一覧（最新データ）")
     
@@ -253,7 +276,6 @@ with tab_list:
         
         col_d1, col_d2, col_d3 = st.columns([2, 2, 1])
         
-        # 1. Excel形式（.xlsx）ダウンロード
         excel_bytes = to_excel_bytes(df_orders)
         col_d1.download_button(
             label="📊 Excelファイル（.xlsx）を出力",
@@ -263,7 +285,6 @@ with tab_list:
             type="primary"
         )
         
-        # 2. CSV形式（.csv）ダウンロード（基幹システム・販売管理取り込み用）
         csv_data = df_orders.to_csv(index=False, encoding="utf_8_sig").encode("utf_8_sig")
         col_d2.download_button(
             label="📥 連携用CSVファイルを出力",
