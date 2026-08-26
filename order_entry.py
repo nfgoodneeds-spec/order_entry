@@ -27,7 +27,6 @@ COLUMNS = [
     "住所", "電話番号", "品番", "品名", "数量", "単位", "単価", "小計", "希望納期", "備考"
 ]
 
-# APIキーはStreamlit Secretsまたは環境変数から自動読み込み
 API_KEY = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
 
 # 文字列の全角/半角/大文字/小文字/特殊文字を正規化する関数
@@ -40,22 +39,17 @@ def normalize_text(text):
 # 画像前処理（スマホ回転補正・コントラスト強調）
 # --------------------------------------------------
 def preprocess_image_for_ocr(img):
-    """カメラ撮影画像やFAX画像をAIが最も読みやすい状態に自動補正"""
     try:
-        # 1. スマホ撮影時のEXIF回転情報を検知し、正しい向きに回転
         img = ImageOps.exif_transpose(img)
     except Exception:
         pass
     
-    # RGBAならRGBに変換
     if img.mode != "RGB":
         img = img.convert("RGB")
     
-    # 2. コントラストを強調（薄い文字・かすれ文字をくっきりさせる）
     enhancer_con = ImageEnhance.Contrast(img)
     img_enhanced = enhancer_con.enhance(1.4)
     
-    # 3. シャープネスを強調（輪郭のぼやけ・手ブレを低減）
     enhancer_sha = ImageEnhance.Sharpness(img_enhanced)
     img_enhanced = enhancer_sha.enhance(1.3)
     
@@ -73,6 +67,8 @@ def load_customer_master():
             {"顧客コード": "2", "顧客名": "株式会社サンプル商事 大阪支店", "郵便番号": "530-0001", "住所": "大阪府大阪市北区梅田2-2-2", "電話番号": "06-9876-5432"},
         ])
         sample_df["_search_text"] = sample_df.apply(lambda r: " ".join([normalize_text(x) for x in r]), axis=1)
+        sample_df["_clean_tel"] = sample_df["電話番号"].apply(lambda x: re.sub(r"\D", "", str(x)))
+        sample_df["_norm_name"] = sample_df["顧客名"].apply(normalize_text)
         return sample_df
 
     df_raw = None
@@ -84,7 +80,7 @@ def load_customer_master():
             continue
 
     if df_raw is None:
-        return pd.DataFrame(columns=["顧客コード", "顧客名", "郵便番号", "住所", "電話番号", "_search_text"])
+        return pd.DataFrame(columns=["顧客コード", "顧客名", "郵便番号", "住所", "電話番号", "_search_text", "_clean_tel", "_norm_name"])
 
     try:
         header_row_idx = 0
@@ -125,10 +121,12 @@ def load_customer_master():
             lambda r: f"{normalize_text(r['顧客コード'])} {normalize_text(r['顧客名'])} {normalize_text(r['郵便番号'])} {normalize_text(r['電話番号'])} {normalize_text(r['住所'])}", 
             axis=1
         )
+        result_df["_clean_tel"] = result_df["電話番号"].apply(lambda x: re.sub(r"\D", "", str(x)))
+        result_df["_norm_name"] = result_df["顧客名"].apply(normalize_text)
         return result_df
     except Exception as e:
         st.warning(f"顧客マスタ処理注記: {e}")
-        return pd.DataFrame(columns=["顧客コード", "顧客名", "郵便番号", "住所", "電話番号", "_search_text"])
+        return pd.DataFrame(columns=["顧客コード", "顧客名", "郵便番号", "住所", "電話番号", "_search_text", "_clean_tel", "_norm_name"])
 
 @st.cache_data(ttl=10)
 def load_item_master():
@@ -179,6 +177,55 @@ def load_item_master():
     except Exception as e:
         st.warning(f"商品マスタ処理注記: {e}")
         return pd.DataFrame(columns=["品番", "品名", "品名索引", "単位", "標準単価", "_search_text"])
+
+def match_customer_from_master(df_cust, extracted_dict):
+    """AIが抽出した情報から顧客マスタを自動探索して最も一致する顧客情報を返す"""
+    if df_cust.empty or not extracted_dict:
+        return extracted_dict
+
+    code_raw = normalize_text(extracted_dict.get("customer_code", ""))
+    tel_raw = re.sub(r"\D", "", normalize_text(extracted_dict.get("customer_tel", "")))
+    name_raw = normalize_text(extracted_dict.get("customer_name", ""))
+
+    matched_row = None
+
+    # 1. 顧客コードで検索
+    if code_raw:
+        m = df_cust[df_cust["顧客コード"].apply(normalize_text) == code_raw]
+        if not m.empty:
+            matched_row = m.iloc[0]
+
+    # 2. 電話番号で検索（ハイフン除去・下6桁以上一致）
+    if matched_row is None and len(tel_raw) >= 6:
+        m = df_cust[df_cust["_clean_tel"].str.contains(tel_raw, na=False)]
+        if not m.empty:
+            matched_row = m.iloc[0]
+
+    # 3. 会社名・店舗名で検索（あいまい一致）
+    if matched_row is None and len(name_raw) >= 2:
+        # 完全部分一致
+        m = df_cust[df_cust["_norm_name"].str.contains(name_raw, na=False)]
+        if not m.empty:
+            matched_row = m.iloc[0]
+        else:
+            # 逆方向（マスタの社名が読み取りテキストに含まれるか）
+            for _, r in df_cust.iterrows():
+                if len(r["_norm_name"]) >= 2 and (r["_norm_name"] in name_raw or name_raw in r["_norm_name"]):
+                    matched_row = r
+                    break
+
+    # マスタと一致した場合はマスタの正確な情報で上書き・補完
+    if matched_row is not None:
+        extracted_dict["customer_code"] = str(matched_row["顧客コード"])
+        extracted_dict["customer_name"] = str(matched_row["顧客名"])
+        extracted_dict["customer_zip"] = str(matched_row["郵便番号"])
+        extracted_dict["customer_tel"] = str(matched_row["電話番号"])
+        extracted_dict["customer_address"] = str(matched_row["住所"])
+        extracted_dict["_matched_from_master"] = True
+    else:
+        extracted_dict["_matched_from_master"] = False
+
+    return extracted_dict
 
 def load_orders_safe():
     if not os.path.exists(ORDERS_CSV):
@@ -270,7 +317,7 @@ def on_customer_selected():
         st.session_state["phone_addr_final"] = ""
 
 # --------------------------------------------------
-# 高精度AI解析エンジン（FAXかすれ・手書き・表構造対応）
+# 高精度AI解析エンジン ＋ 顧客マスタ自動照合
 # --------------------------------------------------
 def extract_order_info(input_data, is_image=False):
     if not API_KEY:
@@ -283,7 +330,6 @@ def extract_order_info(input_data, is_image=False):
         st.error(f"APIキー設定エラー: {e}")
         return None
 
-    # FAX特化型の高度な解析プロンプト
     system_prompt = """
     あなたは日本の商取引・受発注業務における高度な注文書解析エキスパートです。
     提供された画像（FAX・手書き注文書・写真）またはメールテキストから、注文内容を正確に読み取り、指定のJSON形式のみで出力してください。
@@ -300,7 +346,7 @@ def extract_order_info(input_data, is_image=False):
        - 「納期」「着日」「配達希望日」「至急」「○月○日着」等の記述があればYYYY-MM-DD（または日付文字列）で抽出してください。
        - 担当者名、特記事項、備考欄の記述は notes にまとめてください。
 
-    【出力フォーマット（余計な解説・Markdownなしの純粋なJSONテキスト）】
+    【出力フォーマット（純粋なJSONテキスト）】
     {
       "customer_code": "顧客コード（不明なら空文字）",
       "customer_name": "顧客名・会社名（不明なら空文字）",
@@ -326,7 +372,6 @@ def extract_order_info(input_data, is_image=False):
     if not valid_models:
         valid_models = ["models/gemini-1.5-flash", "models/gemini-2.0-flash", "models/gemini-1.5-pro"]
 
-    # 画像の場合は自動補正（回転・コントラスト）を適用
     processed_input = input_data
     if is_image and isinstance(input_data, Image.Image):
         processed_input = preprocess_image_for_ocr(input_data)
@@ -343,7 +388,12 @@ def extract_order_info(input_data, is_image=False):
             raw_text = response.text.strip()
             clean_text = re.sub(r"```json\s*", "", raw_text)
             clean_text = re.sub(r"```\s*", "", clean_text).strip()
-            return json.loads(clean_text)
+            parsed_json = json.loads(clean_text)
+            
+            # 抽出結果を基幹顧客マスタと自動照合・補完
+            df_cust = load_customer_master()
+            enriched_json = match_customer_from_master(df_cust, parsed_json)
+            return enriched_json
         except Exception as e:
             last_error = e
             continue
@@ -367,7 +417,7 @@ tab_fax, tab_mail, tab_phone, tab_list = st.tabs([
 ])
 
 # ==========================================
-# 1. FAX（写真・スキャン自動補正読み取り）
+# 1. FAX（写真・スキャン自動補正 ＆ マスタ自動名寄せ）
 # ==========================================
 with tab_fax:
     st.subheader("FAX注文書の写真・スキャン取り込み")
@@ -376,10 +426,9 @@ with tab_fax:
         uploaded_file = st.file_uploader("注文書画像を選択（またはカメラ撮影）", type=["jpg", "jpeg", "png", "pdf"], key="fax_upload")
         if uploaded_file:
             img = Image.open(uploaded_file)
-            # プレビュー表示
             st.image(img, caption="アップロード画像（自動補正を適用して解析します）", use_container_width=True)
             if st.button("🤖 AIで高精度読取を実行", key="btn_fax_ai", type="primary"):
-                with st.spinner("画像の向き補正・コントラスト強調・Gemini高精度解析中..."):
+                with st.spinner("画像の向き補正・コントラスト強調・顧客マスタ自動照合中..."):
                     result = extract_order_info(img, is_image=True)
                     if result:
                         st.session_state.current_order_fax = result
@@ -389,6 +438,10 @@ with tab_fax:
         st.subheader("📝 読取結果の確認・修正")
         if st.session_state.current_order_fax:
             order = st.session_state.current_order_fax
+            
+            if order.get("_matched_from_master"):
+                st.success(f"🎯 顧客マスタと一致しました: **【{order.get('customer_code')}】 {order.get('customer_name')}**")
+            
             col_fc1, col_fc2 = st.columns([1, 2])
             c_code = col_fc1.text_input("顧客コード", value=order.get("customer_code", ""), key="fax_ccode")
             c_name = col_fc2.text_input("顧客名・会社名", value=order.get("customer_name", ""), key="fax_cname")
@@ -417,7 +470,7 @@ with tab_fax:
                 st.session_state.current_order_fax = None
 
 # ==========================================
-# 2. メール（コピペ解析 ＆ 登録）
+# 2. メール（コピペ解析 ＆ マスタ自動名寄せ）
 # ==========================================
 with tab_mail:
     st.subheader("メール本文のコピペ解析 ＆ 登録")
@@ -431,7 +484,7 @@ with tab_mail:
         )
         if st.button("🤖 メールから注文内容を抽出", key="btn_mail_ai"):
             if mail_text:
-                with st.spinner("Geminiが解析中..."):
+                with st.spinner("Gemini解析 ＆ 顧客マスタ自動照合中..."):
                     result = extract_order_info(mail_text, is_image=False)
                     if result:
                         st.session_state.current_order_mail = result
@@ -441,6 +494,10 @@ with tab_mail:
         st.subheader("📝 抽出結果の確認・修正")
         if st.session_state.current_order_mail:
             m_order = st.session_state.current_order_mail
+            
+            if m_order.get("_matched_from_master"):
+                st.success(f"🎯 顧客マスタと一致しました: **【{m_order.get('customer_code')}】 {m_order.get('customer_name')}**")
+            
             col_mc1, col_mc2 = st.columns([1, 2])
             m_code = col_mc1.text_input("顧客コード", value=m_order.get("customer_code", ""), key="mail_ccode")
             m_name = col_mc2.text_input("顧客名・会社名", value=m_order.get("customer_name", ""), key="mail_cname")
