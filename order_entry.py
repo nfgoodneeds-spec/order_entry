@@ -19,7 +19,7 @@ CUSTOMERS_CSV = "customers.csv"
 
 COLUMNS = [
     "注文日時", "受付種別", "顧客コード", "顧客名", "郵便番号", 
-    "住所", "電話番号", "品番", "品名", "数量", "単価", "小計", "希望納期", "備考"
+    "住所", "電話番号", "品番", "品名", "数量", "単位", "単価", "小計", "希望納期", "備考"
 ]
 
 with st.sidebar:
@@ -33,7 +33,7 @@ with st.sidebar:
     )
 
 # --------------------------------------------------
-# マスタデータの読み込み
+# マスタデータの読み込み（文字コード自動判別・基幹ヘッダ完全対応）
 # --------------------------------------------------
 @st.cache_data(ttl=10)
 def load_customer_master():
@@ -96,22 +96,48 @@ def load_customer_master():
 
 @st.cache_data(ttl=10)
 def load_item_master():
-    """商品マスタCSVの読み込み"""
+    """商品マスタCSVの読み込み（基幹10,000件対応・単価/単位自動取得）"""
     if not os.path.exists(ITEMS_CSV):
         return pd.DataFrame([
-            {"品番": "A-101", "品名": "超音波ノズル先端部品", "標準単価": 12000},
-            {"品番": "A-102", "品名": "高圧ホース 3m", "標準単価": 8500},
-            {"品番": "AK-35", "品名": "専用洗浄液 AK-35", "標準単価": 5500},
-            {"品番": "B-201", "品名": "専用洗浄溶剤 5L", "標準単価": 4500},
-            {"品番": "B-202", "品名": "皮革用リカラー染料（ブラック）", "標準単価": 3200},
-            {"品番": "C-301", "品名": "交換用パッキンセット", "標準単価": 1500},
+            {"品番": "500102", "品名": "溶剤 AK-35", "品名索引": "AK-35", "単位": "缶", "標準単価": 17500},
+            {"品番": "100002", "品名": "BL-10", "品名索引": "BL-10", "単位": "台", "標準単価": 45000},
         ])
+
+    df = None
     for enc in ["cp932", "shift_jis", "utf-8-sig", "utf-8"]:
         try:
-            return pd.read_csv(ITEMS_CSV, encoding=enc, dtype={"品番": str})
+            df = pd.read_csv(ITEMS_CSV, dtype=str, encoding=enc)
+            break
         except Exception:
             continue
-    return pd.DataFrame(columns=["品番", "品名", "標準単価"])
+
+    if df is None:
+        return pd.DataFrame(columns=["品番", "品名", "品名索引", "単位", "標準単価"])
+
+    try:
+        code_col = next((c for c in df.columns if "ｺｰﾄﾞ" in c or "コード" in c or "品番" in c), df.columns[0])
+        name_col = next((c for c in df.columns if ("商品名" in c or "品名" in c) and "索引" not in c), df.columns[1])
+        index_col = next((c for c in df.columns if "索引" in c or "略称" in c), None)
+        unit_col = next((c for c in df.columns if "単位" in c), None)
+        price_col = next((c for c in df.columns if "単価" in c or "価格" in c or "上代" in c), None)
+
+        res_df = pd.DataFrame()
+        res_df["品番"] = df[code_col].fillna("").astype(str).str.strip()
+        res_df["品名"] = df[name_col].fillna("").astype(str).str.strip()
+        res_df["品名索引"] = df[index_col].fillna("").astype(str).str.strip() if index_col else ""
+        res_df["単位"] = df[unit_col].fillna("個").astype(str).str.strip() if unit_col else "個"
+        
+        # 単価の数値整形
+        if price_col:
+            res_df["標準単価"] = pd.to_numeric(df[price_col].astype(str).str.replace(",", ""), errors='coerce').fillna(0).astype(int)
+        else:
+            res_df["標準単価"] = 0
+
+        res_df = res_df[res_df["品名"] != ""]
+        return res_df.reset_index(drop=True)
+    except Exception as e:
+        st.warning(f"商品マスタ処理注記: {e}")
+        return pd.DataFrame(columns=["品番", "品名", "品名索引", "単位", "標準単価"])
 
 def load_orders_safe():
     if not os.path.exists(ORDERS_CSV):
@@ -157,6 +183,7 @@ def save_order_items(channel, code, customer, zip_code, tel, address, delivery_d
             "品番": itm.get("code", itm.get("item_code", "-")),
             "品名": itm.get("name", itm.get("item_name", "")),
             "数量": qty,
+            "単位": itm.get("unit", "個"),
             "単価": price,
             "小計": subtotal,
             "希望納期": str(delivery_date),
@@ -177,13 +204,11 @@ if "current_order_mail" not in st.session_state:
 if "phone_cart" not in st.session_state:
     st.session_state.phone_cart = []
 
-# 電話受付用入力欄の初期化
 for k in ["phone_cust_code_final", "phone_cust_name_final", "phone_zip_final", "phone_tel_final", "phone_addr_final"]:
     if k not in st.session_state:
         st.session_state[k] = ""
 
 def on_customer_selected():
-    """候補が選択された時に各入力欄の値を即座に書き換えるコールバック"""
     sel_val = st.session_state.get("selected_cust_dropdown", "")
     df_cust = load_customer_master()
     if sel_val and sel_val != "新規または手入力":
@@ -319,7 +344,7 @@ with tab_fax:
                 name = c_i1.text_input(f"品名/品番 #{i+1}", value=itm.get("item_name", ""), key=f"fax_item_{i}")
                 qty = c_i2.number_input(f"数量 #{i+1}", value=int(itm.get("quantity", 1)), min_value=1, key=f"fax_qty_{i}")
                 unit = c_i3.text_input(f"単位 #{i+1}", value=itm.get("unit", "個"), key=f"fax_unit_{i}")
-                fax_items_to_save.append({"name": name, "qty": qty, "price": 0})
+                fax_items_to_save.append({"name": name, "qty": qty, "unit": unit, "price": 0})
             
             notes = st.text_area("備考", value=order.get("notes", ""), key="fax_notes")
             if st.button("✅ この内容で注文を確定・保存", key="btn_save_fax", type="primary"):
@@ -336,7 +361,7 @@ with tab_mail:
         mail_text = st.text_area(
             "メール本文を貼り付け", 
             height=200, 
-            placeholder="お世話様です。\nAK-35 2缶 注文をお願いします。\n\n株式会社 ケーアイ CSO\n藤田 信昭\n〒910-0367 福井県坂井市丸岡町羽崎12-16-19\nTEL: 0776-67-1777"
+            placeholder="お世話様です。\n溶剤 AK-35 2缶 注文をお願いします。\n\n株式会社 ケーアイ CSO\n藤田 信昭\n〒910-0367 福井県坂井市丸岡町羽崎12-16-19\nTEL: 0776-67-1777"
         )
         if st.button("🤖 メールから注文内容を抽出", key="btn_mail_ai"):
             if mail_text:
@@ -369,7 +394,7 @@ with tab_mail:
                 name = c_i1.text_input(f"品名/品番 #{i+1}", value=itm.get("item_name", ""), key=f"mail_item_{i}")
                 qty = c_i2.number_input(f"数量 #{i+1}", value=int(itm.get("quantity", 1)), min_value=1, key=f"mail_qty_{i}")
                 unit = c_i3.text_input(f"単位 #{i+1}", value=itm.get("unit", "個"), key=f"mail_unit_{i}")
-                mail_items_to_save.append({"name": name, "qty": qty, "price": 0})
+                mail_items_to_save.append({"name": name, "qty": qty, "unit": unit, "price": 0})
             
             m_notes = st.text_area("備考", value=m_order.get("notes", ""), key="mail_notes")
             if st.button("✅ この内容でメール注文を確定・保存", key="btn_save_mail", type="primary"):
@@ -378,10 +403,12 @@ with tab_mail:
                 st.session_state.current_order_mail = None
                 st.rerun()
 
-# 3. 電話（顧客コード・社名・郵便・電話・住所を完全自動反映）
+# 3. 電話（顧客・商品マスタ1万件完全連動）
 with tab_phone:
     st.subheader("📞 電話受付 - 顧客・商品検索と明細登録")
-    st.caption(f"※ 顧客マスタ読み込み件数: **{len(df_cust_master):,}** 件")
+    col_stat1, col_stat2 = st.columns(2)
+    col_stat1.caption(f"※ 顧客マスタ: **{len(df_cust_master):,}** 件")
+    col_stat2.caption(f"※ 商品マスタ: **{len(df_items_master):,}** 件")
     
     st.markdown("#### 1. 顧客の検索・選択")
     col_cs1, col_cs2 = st.columns([2, 1])
@@ -424,33 +451,36 @@ with tab_phone:
     st.markdown("#### 2. 商品の検索・カート追加")
     
     col_is1, col_is2 = st.columns([2, 3])
-    item_query = col_is1.text_input("🔍 商品検索（品番・品名の一部を入力）", placeholder="例: ホース、ノズル、AK など", key="item_search_query")
+    item_query = col_is1.text_input("🔍 商品検索（コード・商品名・略称の一部を入力）", placeholder="例: AK-35、BL-10、ノズル、ホース など", key="item_search_query")
     
     if item_query:
         matched_items = df_items_master[
             df_items_master["品番"].astype(str).str.contains(item_query, case=False, na=False) |
-            df_items_master["品名"].str.contains(item_query, case=False, na=False)
+            df_items_master["品名"].str.contains(item_query, case=False, na=False) |
+            df_items_master["品名索引"].str.contains(item_query, case=False, na=False)
         ]
     else:
-        matched_items = df_items_master
+        matched_items = df_items_master.head(50)
 
     item_options = [
-        f"【{row['品番']}】 {row['品名']} (定価: ¥{int(row['標準単価']):,})"
+        f"【{row['品番']}】 {row['品名']} ｜ 単位: {row['単位']} ｜ 上代: ¥{int(row['標準単価']):,}"
         for _, row in matched_items.iterrows()
     ]
 
     if item_options:
-        selected_item_str = col_is2.selectbox(f"商品候補（{len(matched_items)} 件該当）", item_options, key="selected_item_dropdown")
+        selected_item_str = col_is2.selectbox(f"商品候補（該当 {len(matched_items)} 件）", item_options, key="selected_item_dropdown")
         selected_code = selected_item_str.split("】")[0].replace("【", "").strip()
         item_row = df_items_master[df_items_master["品番"].astype(str) == selected_code].iloc[0]
         default_price = int(item_row["標準単価"])
         selected_name = str(item_row["品名"])
+        selected_unit = str(item_row["単位"])
 
-        col_p1, col_p2, col_p3 = st.columns([1, 1, 1])
+        col_p1, col_p2, col_p3, col_p4 = st.columns([1, 1, 1, 1])
         qty = col_p1.number_input("数量", min_value=1, value=1, key="add_qty")
-        unit_price = col_p2.number_input("単価（円）", value=default_price, step=100, key="add_price")
+        item_unit_input = col_p2.text_input("単位", value=selected_unit, key="add_unit")
+        unit_price = col_p3.number_input("単価（円）", value=default_price, step=100, key="add_price")
         
-        with col_p3:
+        with col_p4:
             st.write("")
             st.write("")
             if st.button("＋ 明細に追加", use_container_width=True):
@@ -458,6 +488,7 @@ with tab_phone:
                     "code": selected_code,
                     "name": selected_name,
                     "qty": qty,
+                    "unit": item_unit_input,
                     "price": unit_price,
                     "subtotal": qty * unit_price
                 })
@@ -468,7 +499,7 @@ with tab_phone:
     if st.session_state.phone_cart:
         st.write("### 📋 注文明細一覧")
         cart_df = pd.DataFrame(st.session_state.phone_cart)
-        st.dataframe(cart_df.rename(columns={"code": "品番", "name": "品名", "qty": "数量", "price": "単価(円)", "subtotal": "小計(円)"}), use_container_width=True)
+        st.dataframe(cart_df.rename(columns={"code": "品番", "name": "品名", "qty": "数量", "unit": "単位", "price": "単価(円)", "subtotal": "小計(円)"}), use_container_width=True)
         total_amount = sum(item["subtotal"] for item in st.session_state.phone_cart)
         st.markdown(f"#### 💰 合計金額: **¥{total_amount:,}**（税別）")
         
