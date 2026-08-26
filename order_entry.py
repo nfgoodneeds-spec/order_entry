@@ -96,7 +96,7 @@ def load_customer_master():
 
 @st.cache_data(ttl=10)
 def load_item_master():
-    """商品マスタCSVの読み込み（基幹新CSV対応・売上単価/ランク単価自動取得）"""
+    """商品マスタCSVの読み込み"""
     if not os.path.exists(ITEMS_CSV):
         return pd.DataFrame([
             {"品番": "500102", "品名": "溶剤 AK-35", "品名索引": "AK-35", "単位": "缶", "標準単価": 26000},
@@ -402,7 +402,7 @@ with tab_mail:
                 st.session_state.current_order_mail = None
                 st.rerun()
 
-# 3. 電話（商品・単価・単位 完全連動）
+# 3. 電話（マスタ検索＋自由手入力両対応）
 with tab_phone:
     st.subheader("📞 電話受付 - 顧客・商品検索と明細登録")
     col_stat1, col_stat2 = st.columns(2)
@@ -449,59 +449,96 @@ with tab_phone:
     st.markdown("---")
     st.markdown("#### 2. 商品の検索・カート追加")
     
-    col_is1, col_is2 = st.columns([2, 3])
-    item_query = col_is1.text_input("🔍 商品検索（コード・商品名・略称の一部を入力）", placeholder="例: AK、BL、500102、ホース など", key="item_search_query")
+    # 商品追加方式の切り替え（マスタ検索 or 手入力）
+    item_mode = st.radio(
+        "追加方法の選択:",
+        ["🔍 マスタから検索して追加", "✏️ マスタにない商品・特注品を手入力で追加"],
+        horizontal=True
+    )
     
-    if item_query:
-        matched_items = df_items_master[
-            df_items_master["品番"].astype(str).str.contains(item_query, case=False, na=False) |
-            df_items_master["品名"].str.contains(item_query, case=False, na=False) |
-            df_items_master["品名索引"].str.contains(item_query, case=False, na=False)
+    if item_mode == "🔍 マスタから検索して追加":
+        col_is1, col_is2 = st.columns([2, 3])
+        item_query = col_is1.text_input("🔍 商品検索（コード・商品名・略称の一部を入力）", placeholder="例: AK、BL、500102、ノズル など", key="item_search_query")
+        
+        if item_query:
+            matched_items = df_items_master[
+                df_items_master["品番"].astype(str).str.contains(item_query, case=False, na=False) |
+                df_items_master["品名"].str.contains(item_query, case=False, na=False) |
+                df_items_master["品名索引"].str.contains(item_query, case=False, na=False)
+            ]
+        else:
+            matched_items = df_items_master.head(50)
+
+        item_options = [
+            f"【{row['品番']}】 {row['品名']} ｜ 単位: {row['単位']} ｜ 単価: ¥{int(row['標準単価']):,}"
+            for _, row in matched_items.iterrows()
         ]
+
+        if item_options:
+            selected_item_str = col_is2.selectbox(
+                f"商品候補（該当 {len(matched_items)} 件）", 
+                item_options, 
+                key=f"item_select_box_{item_query}"
+            )
+            
+            selected_code = selected_item_str.split("】")[0].replace("【", "").strip()
+            item_row = df_items_master[df_items_master["品番"].astype(str) == selected_code].iloc[0]
+            selected_name = str(item_row["品名"])
+            auto_unit = str(item_row["単位"])
+            auto_price = int(item_row["標準単価"])
+
+            col_p1, col_p2, col_p3, col_p4 = st.columns([1, 1, 1, 1])
+            qty = col_p1.number_input("数量", min_value=1, value=1, key=f"qty_{selected_code}_{item_query}")
+            item_unit_input = col_p2.text_input("単位", value=auto_unit, key=f"unit_{selected_code}_{item_query}")
+            unit_price = col_p3.number_input("単価（円）", value=auto_price, step=100, key=f"price_{selected_code}_{item_query}")
+            
+            with col_p4:
+                st.write("")
+                st.write("")
+                if st.button("＋ 明細に追加", use_container_width=True, key="btn_add_master_item"):
+                    st.session_state.phone_cart.append({
+                        "code": selected_code,
+                        "name": selected_name,
+                        "qty": qty,
+                        "unit": item_unit_input,
+                        "price": unit_price,
+                        "subtotal": qty * unit_price
+                    })
+                    st.rerun()
+        else:
+            st.warning("⚠️ 一致する商品が見つかりません。上のラジオボタンで「✏️ マスタにない商品・特注品を手入力で追加」を選ぶと直接入力して登録できます。")
+
     else:
-        matched_items = df_items_master.head(50)
-
-    item_options = [
-        f"【{row['品番']}】 {row['品名']} ｜ 単位: {row['単位']} ｜ 単価: ¥{int(row['標準単価']):,}"
-        for _, row in matched_items.iterrows()
-    ]
-
-    if item_options:
-        selected_item_str = col_is2.selectbox(
-            f"商品候補（該当 {len(matched_items)} 件）", 
-            item_options, 
-            key=f"item_select_box_{item_query}"
-        )
+        # 手入力モード
+        st.info("💡 マスタに登録されていない商品・修理費用・特注品などを直接手入力してカートに追加できます。")
+        col_m1, col_m2 = st.columns([1, 2])
+        manual_code = col_m1.text_input("品番・商品コード（任意）", value="-", key="manual_item_code")
+        manual_name = col_m2.text_input("商品名・品名（必須）", placeholder="例: 特注超音波アタッチメント加工代", key="manual_item_name")
         
-        # 選択中の商品から確実にコード・品名・単位・単価をリアルタイム抽出
-        selected_code = selected_item_str.split("】")[0].replace("【", "").strip()
-        item_row = df_items_master[df_items_master["品番"].astype(str) == selected_code].iloc[0]
-        selected_name = str(item_row["品名"])
-        auto_unit = str(item_row["単位"])
-        auto_price = int(item_row["標準単価"])
-
-        col_p1, col_p2, col_p3, col_p4 = st.columns([1, 1, 1, 1])
-        # 商品が変わるごとに動的キーで初期値を連動
-        qty = col_p1.number_input("数量", min_value=1, value=1, key=f"qty_{selected_code}")
-        item_unit_input = col_p2.text_input("単位", value=auto_unit, key=f"unit_{selected_code}")
-        unit_price = col_p3.number_input("単価（円）", value=auto_price, step=100, key=f"price_{selected_code}")
+        col_m3, col_m4, col_m5, col_m6 = st.columns([1, 1, 1, 1])
+        manual_qty = col_m3.number_input("数量", min_value=1, value=1, key="manual_item_qty")
+        manual_unit = col_m4.text_input("単位", value="個", key="manual_item_unit")
+        manual_price = col_m5.number_input("単価（円）", min_value=0, value=0, step=100, key="manual_item_price")
         
-        with col_p4:
+        with col_m6:
             st.write("")
             st.write("")
-            if st.button("＋ 明細に追加", use_container_width=True):
-                st.session_state.phone_cart.append({
-                    "code": selected_code,
-                    "name": selected_name,
-                    "qty": qty,
-                    "unit": item_unit_input,
-                    "price": unit_price,
-                    "subtotal": qty * unit_price
-                })
-                st.rerun()
-    else:
-        st.warning("一致する商品が見つかりません。")
+            if st.button("＋ 手入力商品を追加", use_container_width=True, key="btn_add_manual_item"):
+                if not manual_name.strip():
+                    st.error("商品名を入力してください。")
+                else:
+                    st.session_state.phone_cart.append({
+                        "code": manual_code.strip() if manual_code.strip() else "-",
+                        "name": manual_name.strip(),
+                        "qty": manual_qty,
+                        "unit": manual_unit.strip(),
+                        "price": manual_price,
+                        "subtotal": manual_qty * manual_price
+                    })
+                    st.success(f"「{manual_name}」をカートに追加しました！")
+                    st.rerun()
 
+    # カート明細一覧
     if st.session_state.phone_cart:
         st.write("### 📋 注文明細一覧")
         cart_df = pd.DataFrame(st.session_state.phone_cart)
@@ -527,7 +564,7 @@ with tab_phone:
                 st.session_state.phone_cart = []
                 st.rerun()
     else:
-        st.info("商品を選択して「＋ 明細に追加」を押してください。")
+        st.info("商品を選択または手入力して「＋ 明細に追加」を押してください。")
 
 # 4. 登録済み一覧
 with tab_list:
