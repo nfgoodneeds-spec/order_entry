@@ -4,6 +4,7 @@ import json
 import os
 import io
 import re
+import unicodedata
 from datetime import datetime
 import google.generativeai as genai
 from PIL import Image
@@ -32,17 +33,26 @@ with st.sidebar:
         placeholder="AI Studioで取得したAPIキーを入力"
     )
 
+# 文字列の全角/半角/大文字/小文字/特殊文字を正規化する関数
+def normalize_text(text):
+    if text is None:
+        return ""
+    # NFKC正規化（全角英数→半角、半角カナ→全角、㈱→(株) など）＋小文字化
+    return unicodedata.normalize('NFKC', str(text)).lower().strip()
+
 # --------------------------------------------------
-# マスタデータの読み込み（文字コード自動判別・基幹ヘッダ完全対応）
+# マスタデータの読み込み（検索用インデックス自動作成）
 # --------------------------------------------------
 @st.cache_data(ttl=10)
 def load_customer_master():
-    """顧客マスタCSVの読み込み"""
+    """顧客マスタCSVの読み込み（正規化インデックス付き）"""
     if not os.path.exists(CUSTOMERS_CSV):
-        return pd.DataFrame([
+        sample_df = pd.DataFrame([
             {"顧客コード": "1", "顧客名": "株式会社サンプル商事 本社", "郵便番号": "100-0005", "住所": "東京都千代田区丸の内1-1-1", "電話番号": "03-1234-5678"},
             {"顧客コード": "2", "顧客名": "株式会社サンプル商事 大阪支店", "郵便番号": "530-0001", "住所": "大阪府大阪市北区梅田2-2-2", "電話番号": "06-9876-5432"},
         ])
+        sample_df["_search_text"] = sample_df.apply(lambda r: " ".join([normalize_text(x) for x in r]), axis=1)
+        return sample_df
 
     df_raw = None
     for enc in ["cp932", "shift_jis", "utf-8-sig", "utf-8"]:
@@ -53,7 +63,7 @@ def load_customer_master():
             continue
 
     if df_raw is None:
-        return pd.DataFrame(columns=["顧客コード", "顧客名", "郵便番号", "住所", "電話番号"])
+        return pd.DataFrame(columns=["顧客コード", "顧客名", "郵便番号", "住所", "電話番号", "_search_text"])
 
     try:
         header_row_idx = 0
@@ -88,20 +98,28 @@ def load_customer_master():
             result_df["住所"] = ""
             
         result_df = result_df[result_df["顧客名"] != ""]
-        result_df = result_df[~result_df["顧客名"].str.contains("名称|得意先", na=False)]
-        return result_df.reset_index(drop=True)
+        result_df = result_df[~result_df["顧客名"].str.contains("名称|得意先", na=False)].reset_index(drop=True)
+        
+        # あいまい検索用の正規化文字列列を作成（高速化）
+        result_df["_search_text"] = result_df.apply(
+            lambda r: f"{normalize_text(r['顧客コード'])} {normalize_text(r['顧客名'])} {normalize_text(r['郵便番号'])} {normalize_text(r['電話番号'])} {normalize_text(r['住所'])}", 
+            axis=1
+        )
+        return result_df
     except Exception as e:
         st.warning(f"顧客マスタ処理注記: {e}")
-        return pd.DataFrame(columns=["顧客コード", "顧客名", "郵便番号", "住所", "電話番号"])
+        return pd.DataFrame(columns=["顧客コード", "顧客名", "郵便番号", "住所", "電話番号", "_search_text"])
 
 @st.cache_data(ttl=10)
 def load_item_master():
-    """商品マスタCSVの読み込み"""
+    """商品マスタCSVの読み込み（正規化インデックス付き）"""
     if not os.path.exists(ITEMS_CSV):
-        return pd.DataFrame([
+        sample_df = pd.DataFrame([
             {"品番": "500102", "品名": "溶剤 AK-35", "品名索引": "AK-35", "単位": "缶", "標準単価": 26000},
             {"品番": "100002", "品名": "BL-10", "品名索引": "BL-10", "単位": "台", "標準単価": 50000},
         ])
+        sample_df["_search_text"] = sample_df.apply(lambda r: " ".join([normalize_text(x) for x in r]), axis=1)
+        return sample_df
 
     df = None
     for enc in ["cp932", "shift_jis", "utf-8-sig", "utf-8"]:
@@ -112,7 +130,7 @@ def load_item_master():
             continue
 
     if df is None:
-        return pd.DataFrame(columns=["品番", "品名", "品名索引", "単位", "標準単価"])
+        return pd.DataFrame(columns=["品番", "品名", "品名索引", "単位", "標準単価", "_search_text"])
 
     try:
         code_col = next((c for c in df.columns if "ｺｰﾄﾞ" in c or "コード" in c or "品番" in c), df.columns[0])
@@ -132,11 +150,17 @@ def load_item_master():
         else:
             res_df["標準単価"] = 0
 
-        res_df = res_df[res_df["品名"] != ""]
-        return res_df.reset_index(drop=True)
+        res_df = res_df[res_df["品名"] != ""].reset_index(drop=True)
+        
+        # あいまい検索用の正規化文字列列を作成
+        res_df["_search_text"] = res_df.apply(
+            lambda r: f"{normalize_text(r['品番'])} {normalize_text(r['品名'])} {normalize_text(r['品名索引'])}", 
+            axis=1
+        )
+        return res_df
     except Exception as e:
         st.warning(f"商品マスタ処理注記: {e}")
-        return pd.DataFrame(columns=["品番", "品名", "品名索引", "単位", "標準単価"])
+        return pd.DataFrame(columns=["品番", "品名", "品名索引", "単位", "標準単価", "_search_text"])
 
 def load_orders_safe():
     if not os.path.exists(ORDERS_CSV):
@@ -402,7 +426,7 @@ with tab_mail:
                 st.session_state.current_order_mail = None
                 st.rerun()
 
-# 3. 電話（マスタ検索＋自由手入力両対応）
+# 3. 電話（全角・半角・大文字・小文字・特殊文字 あいまい完全一致）
 with tab_phone:
     st.subheader("📞 電話受付 - 顧客・商品検索と明細登録")
     col_stat1, col_stat2 = st.columns(2)
@@ -411,16 +435,14 @@ with tab_phone:
     
     st.markdown("#### 1. 顧客の検索・選択")
     col_cs1, col_cs2 = st.columns([2, 1])
-    cust_query = col_cs1.text_input("🔍 顧客検索（コード・社名・郵便番号・電話・住所の一部を入力）", placeholder="例: 創美、アタゴ、910、0776、館林市 など", key="cust_search_query")
+    cust_query_raw = col_cs1.text_input("🔍 顧客検索（コード・社名・郵便・TEL・住所 ※全角半角どちらでも可）", placeholder="例: 創美、アタゴ、910、0776、館林市 など", key="cust_search_query")
     req_date = col_cs2.date_input("希望納期", key="phone_date")
 
-    if cust_query:
+    # 全角・半角正規化検索
+    norm_cust_q = normalize_text(cust_query_raw)
+    if norm_cust_q:
         matched_cust = df_cust_master[
-            df_cust_master["顧客コード"].str.contains(cust_query, case=False, na=False) |
-            df_cust_master["顧客名"].str.contains(cust_query, case=False, na=False) |
-            df_cust_master["郵便番号"].str.contains(cust_query, case=False, na=False) |
-            df_cust_master["電話番号"].str.contains(cust_query, case=False, na=False) |
-            df_cust_master["住所"].str.contains(cust_query, case=False, na=False)
+            df_cust_master["_search_text"].str.contains(norm_cust_q, na=False)
         ]
     else:
         matched_cust = df_cust_master.head(50)
@@ -449,7 +471,6 @@ with tab_phone:
     st.markdown("---")
     st.markdown("#### 2. 商品の検索・カート追加")
     
-    # 商品追加方式の切り替え（マスタ検索 or 手入力）
     item_mode = st.radio(
         "追加方法の選択:",
         ["🔍 マスタから検索して追加", "✏️ マスタにない商品・特注品を手入力で追加"],
@@ -458,13 +479,13 @@ with tab_phone:
     
     if item_mode == "🔍 マスタから検索して追加":
         col_is1, col_is2 = st.columns([2, 3])
-        item_query = col_is1.text_input("🔍 商品検索（コード・商品名・略称の一部を入力）", placeholder="例: AK、BL、500102、ノズル など", key="item_search_query")
+        item_query_raw = col_is1.text_input("🔍 商品検索（コード・商品名・略称 ※全角半角どちらでも可）", placeholder="例: AK、BL、500102、ノズル など", key="item_search_query")
         
-        if item_query:
+        # 全角・半角正規化検索
+        norm_item_q = normalize_text(item_query_raw)
+        if norm_item_q:
             matched_items = df_items_master[
-                df_items_master["品番"].astype(str).str.contains(item_query, case=False, na=False) |
-                df_items_master["品名"].str.contains(item_query, case=False, na=False) |
-                df_items_master["品名索引"].str.contains(item_query, case=False, na=False)
+                df_items_master["_search_text"].str.contains(norm_item_q, na=False)
             ]
         else:
             matched_items = df_items_master.head(50)
@@ -478,7 +499,7 @@ with tab_phone:
             selected_item_str = col_is2.selectbox(
                 f"商品候補（該当 {len(matched_items)} 件）", 
                 item_options, 
-                key=f"item_select_box_{item_query}"
+                key=f"item_select_box_{norm_item_q}"
             )
             
             selected_code = selected_item_str.split("】")[0].replace("【", "").strip()
@@ -488,9 +509,9 @@ with tab_phone:
             auto_price = int(item_row["標準単価"])
 
             col_p1, col_p2, col_p3, col_p4 = st.columns([1, 1, 1, 1])
-            qty = col_p1.number_input("数量", min_value=1, value=1, key=f"qty_{selected_code}_{item_query}")
-            item_unit_input = col_p2.text_input("単位", value=auto_unit, key=f"unit_{selected_code}_{item_query}")
-            unit_price = col_p3.number_input("単価（円）", value=auto_price, step=100, key=f"price_{selected_code}_{item_query}")
+            qty = col_p1.number_input("数量", min_value=1, value=1, key=f"qty_{selected_code}_{norm_item_q}")
+            item_unit_input = col_p2.text_input("単位", value=auto_unit, key=f"unit_{selected_code}_{norm_item_q}")
+            unit_price = col_p3.number_input("単価（円）", value=auto_price, step=100, key=f"price_{selected_code}_{norm_item_q}")
             
             with col_p4:
                 st.write("")
@@ -506,10 +527,9 @@ with tab_phone:
                     })
                     st.rerun()
         else:
-            st.warning("⚠️ 一致する商品が見つかりません。上のラジオボタンで「✏️ マスタにない商品・特注品を手入力で追加」を選ぶと直接入力して登録できます。")
+            st.warning("⚠️ 一致する商品が見つかりません。上の「✏️ マスタにない商品・特注品を手入力で追加」を選ぶと直接手入力で登録できます。")
 
     else:
-        # 手入力モード
         st.info("💡 マスタに登録されていない商品・修理費用・特注品などを直接手入力してカートに追加できます。")
         col_m1, col_m2 = st.columns([1, 2])
         manual_code = col_m1.text_input("品番・商品コード（任意）", value="-", key="manual_item_code")
