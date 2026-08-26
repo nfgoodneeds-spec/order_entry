@@ -10,9 +10,13 @@ import google.generativeai as genai
 from PIL import Image
 
 # --------------------------------------------------
-# 初期設定 & サイドバー設定
+# 初期設定（サイドバーを閉じ、全画面を広く使う設定）
 # --------------------------------------------------
-st.set_page_config(page_title="受発注DXタブレットアプリ", layout="wide")
+st.set_page_config(
+    page_title="受発注DXタブレットアプリ", 
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
 
 ORDERS_CSV = "orders_data.csv"
 ITEMS_CSV = "items.csv"
@@ -23,29 +27,21 @@ COLUMNS = [
     "住所", "電話番号", "品番", "品名", "数量", "単位", "単価", "小計", "希望納期", "備考"
 ]
 
-with st.sidebar:
-    st.header("⚙️ 設定")
-    secret_key = st.secrets.get("GEMINI_API_KEY", "")
-    api_key_input = st.text_input(
-        "Gemini API Key", 
-        value=secret_key, 
-        type="password",
-        placeholder="AI Studioで取得したAPIキーを入力"
-    )
+# APIキーはStreamlit Secretsまたは環境変数から自動読み込み
+API_KEY = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
 
 # 文字列の全角/半角/大文字/小文字/特殊文字を正規化する関数
 def normalize_text(text):
     if text is None:
         return ""
-    # NFKC正規化（全角英数→半角、半角カナ→全角、㈱→(株) など）＋小文字化
     return unicodedata.normalize('NFKC', str(text)).lower().strip()
 
 # --------------------------------------------------
-# マスタデータの読み込み（検索用インデックス自動作成）
+# マスタデータの読み込み（文字コード自動判別・検索インデックス付き）
 # --------------------------------------------------
 @st.cache_data(ttl=10)
 def load_customer_master():
-    """顧客マスタCSVの読み込み（正規化インデックス付き）"""
+    """顧客マスタCSVの読み込み"""
     if not os.path.exists(CUSTOMERS_CSV):
         sample_df = pd.DataFrame([
             {"顧客コード": "1", "顧客名": "株式会社サンプル商事 本社", "郵便番号": "100-0005", "住所": "東京都千代田区丸の内1-1-1", "電話番号": "03-1234-5678"},
@@ -100,7 +96,6 @@ def load_customer_master():
         result_df = result_df[result_df["顧客名"] != ""]
         result_df = result_df[~result_df["顧客名"].str.contains("名称|得意先", na=False)].reset_index(drop=True)
         
-        # あいまい検索用の正規化文字列列を作成（高速化）
         result_df["_search_text"] = result_df.apply(
             lambda r: f"{normalize_text(r['顧客コード'])} {normalize_text(r['顧客名'])} {normalize_text(r['郵便番号'])} {normalize_text(r['電話番号'])} {normalize_text(r['住所'])}", 
             axis=1
@@ -112,7 +107,7 @@ def load_customer_master():
 
 @st.cache_data(ttl=10)
 def load_item_master():
-    """商品マスタCSVの読み込み（正規化インデックス付き）"""
+    """商品マスタCSVの読み込み"""
     if not os.path.exists(ITEMS_CSV):
         sample_df = pd.DataFrame([
             {"品番": "500102", "品名": "溶剤 AK-35", "品名索引": "AK-35", "単位": "缶", "標準単価": 26000},
@@ -151,8 +146,6 @@ def load_item_master():
             res_df["標準単価"] = 0
 
         res_df = res_df[res_df["品名"] != ""].reset_index(drop=True)
-        
-        # あいまい検索用の正規化文字列列を作成
         res_df["_search_text"] = res_df.apply(
             lambda r: f"{normalize_text(r['品番'])} {normalize_text(r['品名'])} {normalize_text(r['品名索引'])}", 
             axis=1
@@ -252,12 +245,12 @@ def on_customer_selected():
         st.session_state["phone_addr_final"] = ""
 
 def extract_order_info(input_data, is_image=False):
-    if not api_key_input:
-        st.error("左側サイドバーにGemini APIキーを入力してください。")
+    if not API_KEY:
+        st.error("APIキーが設定されていません。Streamlit CloudのSecretsに GEMINI_API_KEY を設定してください。")
         return None
         
     try:
-        genai.configure(api_key=api_key_input.strip())
+        genai.configure(api_key=API_KEY.strip())
     except Exception as e:
         st.error(f"APIキー設定エラー: {e}")
         return None
@@ -328,7 +321,9 @@ tab_fax, tab_mail, tab_phone, tab_list = st.tabs([
     "📋 登録済み注文一覧"
 ])
 
-# 1. FAX
+# ==========================================
+# 1. FAX（写真・スキャン）
+# ==========================================
 with tab_fax:
     st.subheader("FAX注文書の写真・スキャン取り込み")
     col1, col2 = st.columns([1, 1])
@@ -375,7 +370,9 @@ with tab_fax:
                 st.success("FAX注文を保存しました！「登録済み注文一覧」タブを確認してください。")
                 st.session_state.current_order_fax = None
 
-# 2. メール
+# ==========================================
+# 2. メール（コピペ解析 ＆ 登録）
+# ==========================================
 with tab_mail:
     st.subheader("メール本文のコピペ解析 ＆ 登録")
     col_m1, col_m2 = st.columns([1, 1])
@@ -426,7 +423,9 @@ with tab_mail:
                 st.session_state.current_order_mail = None
                 st.rerun()
 
-# 3. 電話（全角・半角・大文字・小文字・特殊文字 あいまい完全一致）
+# ==========================================
+# 3. 電話（全角・半角 あいまい検索 ＆ 手入力両対応）
+# ==========================================
 with tab_phone:
     st.subheader("📞 電話受付 - 顧客・商品検索と明細登録")
     col_stat1, col_stat2 = st.columns(2)
@@ -438,7 +437,6 @@ with tab_phone:
     cust_query_raw = col_cs1.text_input("🔍 顧客検索（コード・社名・郵便・TEL・住所 ※全角半角どちらでも可）", placeholder="例: 創美、アタゴ、910、0776、館林市 など", key="cust_search_query")
     req_date = col_cs2.date_input("希望納期", key="phone_date")
 
-    # 全角・半角正規化検索
     norm_cust_q = normalize_text(cust_query_raw)
     if norm_cust_q:
         matched_cust = df_cust_master[
@@ -481,7 +479,6 @@ with tab_phone:
         col_is1, col_is2 = st.columns([2, 3])
         item_query_raw = col_is1.text_input("🔍 商品検索（コード・商品名・略称 ※全角半角どちらでも可）", placeholder="例: AK、BL、500102、ノズル など", key="item_search_query")
         
-        # 全角・半角正規化検索
         norm_item_q = normalize_text(item_query_raw)
         if norm_item_q:
             matched_items = df_items_master[
@@ -586,7 +583,9 @@ with tab_phone:
     else:
         st.info("商品を選択または手入力して「＋ 明細に追加」を押してください。")
 
+# ==========================================
 # 4. 登録済み一覧
+# ==========================================
 with tab_list:
     st.subheader("📋 登録済み注文一覧（最新データ）")
     
