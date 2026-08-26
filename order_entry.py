@@ -21,14 +21,35 @@ from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 st.set_page_config(page_title="受発注DXタブレットアプリ", layout="wide")
 
 CSV_FILE = "orders_data.csv"
+COLUMNS = ["注文日時", "受付種別", "顧客名", "電話番号", "住所", "品番", "品名", "数量", "単価", "小計", "希望納期", "備考"]
+
+# CSVを安全に読み込む関数（フォーマット不整合を自動修復）
+def load_orders_safe():
+    if not os.path.exists(CSV_FILE):
+        return pd.DataFrame(columns=COLUMNS)
+    try:
+        df = pd.read_csv(CSV_FILE, encoding="utf-8-sig")
+        # 必要な列がすべて揃っているかチェック
+        if list(df.columns) != COLUMNS:
+            # 列が古い形式の場合は再初期化
+            df = pd.DataFrame(columns=COLUMNS)
+            df.to_csv(CSV_FILE, index=False, encoding="utf-8-sig")
+        return df
+    except Exception:
+        # 読み込みエラー（行ごとの列数ズレ等）が起きた場合は新規初期化
+        df = pd.DataFrame(columns=COLUMNS)
+        df.to_csv(CSV_FILE, index=False, encoding="utf-8-sig")
+        return df
 
 # 日本語フォント登録（PDF用）
-pdfmetrics.registerFont(UnicodeCIDFont('HeiseiKakuGo-W5'))
+try:
+    pdfmetrics.registerFont(UnicodeCIDFont('HeiseiKakuGo-W5'))
+except Exception:
+    pass
 
 # PDF帳票生成関数
 def generate_pdf_report(df):
     buffer = io.BytesIO()
-    # A4横向きレイアウト
     doc = SimpleDocTemplate(
         buffer, 
         pagesize=landscape(A4),
@@ -42,7 +63,7 @@ def generate_pdf_report(df):
         fontName='HeiseiKakuGo-W5',
         fontSize=18,
         leading=22,
-        alignment=1, # 中央揃え
+        alignment=1,
         textColor=colors.HexColor('#1E293B')
     )
     meta_style = ParagraphStyle(
@@ -50,7 +71,7 @@ def generate_pdf_report(df):
         fontName='HeiseiKakuGo-W5',
         fontSize=9,
         leading=12,
-        alignment=2, # 右揃え
+        alignment=2,
         textColor=colors.HexColor('#64748B')
     )
     cell_style = ParagraphStyle(
@@ -65,23 +86,19 @@ def generate_pdf_report(df):
         fontName='HeiseiKakuGo-W5',
         fontSize=8.5,
         leading=11,
-        fontName_bold='HeiseiKakuGo-W5',
         textColor=colors.whitesmoke,
         alignment=1
     )
 
-    # タイトルと出力日時
     elements.append(Paragraph("受 発 注 伝 票 一 覧 表", title_style))
     elements.append(Spacer(1, 5))
     elements.append(Paragraph(f"出力日時: {datetime.now().strftime('%Y年%m月%d日 %H:%M')}", meta_style))
     elements.append(Spacer(1, 10))
 
-    # 表データ整形
     headers = ["注文日時", "種別", "顧客名", "電話番号", "住所・納品先", "品番", "品名", "数量", "単価", "小計", "納期"]
     table_data = [[Paragraph(h, header_style) for h in headers]]
 
     for _, row in df.iterrows():
-        # 日時を短く成形
         dt_str = str(row.get("注文日時", ""))[:16]
         table_data.append([
             Paragraph(dt_str, cell_style),
@@ -97,9 +114,7 @@ def generate_pdf_report(df):
             Paragraph(str(row.get("希望納期", "")), cell_style),
         ])
 
-    # A4横（約800pt）に合わせた列幅設定
     col_widths = [75, 30, 85, 65, 140, 50, 110, 30, 45, 50, 60]
-    
     t = Table(table_data, colWidths=col_widths, repeatRows=1)
     t.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1E293B')),
@@ -138,10 +153,11 @@ def save_order_items(channel, customer, tel, address, delivery_date, items, note
             "備考": notes
         })
     df_new = pd.DataFrame(new_rows)
-    if not os.path.exists(CSV_FILE):
-        df_new.to_csv(CSV_FILE, index=False, encoding="utf-8-sig")
-    else:
-        df_new.to_csv(CSV_FILE, mode="a", header=False, index=False, encoding="utf-8-sig")
+    
+    # 既存データと安全に結合して保存
+    df_existing = load_orders_safe()
+    df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+    df_combined.to_csv(CSV_FILE, index=False, encoding="utf-8-sig")
 
 # APIキー設定
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
@@ -321,42 +337,40 @@ with tab_phone:
                 st.session_state.phone_cart = []
                 st.rerun()
 
-# 4. 登録済み一覧（PDF印刷ボタン付き）
+# 4. 登録済み一覧（安全読み込み ＆ PDF・CSV出力）
 with tab_list:
     st.subheader("📋 登録済み注文一覧（最新データ）")
     
-    if os.path.exists(CSV_FILE):
+    df_orders = load_orders_safe()
+    
+    if not df_orders.empty:
+        st.dataframe(df_orders, use_container_width=True)
+        
+        col_d1, col_d2, col_d3 = st.columns([2, 2, 1])
+        csv_data = df_orders.to_csv(index=False, encoding="utf_8_sig").encode("utf_8_sig")
+        
+        col_d1.download_button(
+            label="📥 販売管理・配送連携用CSV",
+            data=csv_data,
+            file_name=f"orders_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv",
+        )
+        
         try:
-            df_orders = pd.read_csv(CSV_FILE, encoding="utf-8-sig")
-            if not df_orders.empty:
-                st.dataframe(df_orders, use_container_width=True)
-                
-                col_d1, col_d2, col_d3 = st.columns([2, 2, 1])
-                csv_data = df_orders.to_csv(index=False, encoding="utf_8_sig").encode("utf_8_sig")
-                
-                col_d1.download_button(
-                    label="📥 販売管理・配送連携用CSV",
-                    data=csv_data,
-                    file_name=f"orders_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                    mime="text/csv",
-                )
-                
-                # PDF帳票の生成とダウンロード・印刷ボタン
-                pdf_bytes = generate_pdf_report(df_orders)
-                col_d2.download_button(
-                    label="🖨️ A4印刷用PDF帳票（全項目）を出力",
-                    data=pdf_bytes,
-                    file_name=f"order_report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-                    mime="application/pdf",
-                    type="primary"
-                )
-                
-                if col_d3.button("🗑️ 全件クリア"):
-                    os.remove(CSV_FILE)
-                    st.rerun()
-            else:
-                st.info("まだ登録された注文データはありません。")
+            pdf_bytes = generate_pdf_report(df_orders)
+            col_d2.download_button(
+                label="🖨️ A4印刷用PDF帳票（全項目）を出力",
+                data=pdf_bytes,
+                file_name=f"order_report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                mime="application/pdf",
+                type="primary"
+            )
         except Exception as e:
-            st.warning(f"データの読み込み待機中: {e}")
+            col_d2.error(f"PDF生成エラー: {e}")
+        
+        if col_d3.button("🗑️ 全件クリア"):
+            if os.path.exists(CSV_FILE):
+                os.remove(CSV_FILE)
+            st.rerun()
     else:
         st.info("まだ登録された注文データはありません。")
